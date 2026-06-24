@@ -4,7 +4,8 @@ const WebSocket = require("ws");
 const PORT = Number(process.env.PORT || 10000);
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_TTL_MS = 1000 * 60 * 60;
-const MAX_TEAM_SIZE = 5;
+const MAX_TEAM_SIZE = 10;
+const MAX_PLAYERS = 20;
 
 const rooms = new Map();
 
@@ -26,15 +27,20 @@ function makeUniqueCode() {
 
 function normalizeMode(mode) {
   const text = String(mode || "1v1").toLowerCase();
-  const match = text.match(/^([1-5])v\1$/);
-  if (!match) return "1v1";
-  const teamSize = Math.max(1, Math.min(MAX_TEAM_SIZE, Number(match[1])));
-  return `${teamSize}v${teamSize}`;
+  const parts = text.split("v");
+  if (parts.length < 2 || parts.length > 3) return "1v1";
+
+  const teamSize = Number(parts[0]);
+  if (!Number.isInteger(teamSize) || teamSize < 1 || teamSize > MAX_TEAM_SIZE) return "1v1";
+  if (!parts.every((part) => Number(part) === teamSize)) return "1v1";
+  if (teamSize * parts.length > MAX_PLAYERS) return "1v1";
+
+  return parts.map(() => String(teamSize)).join("v");
 }
 
 function requiredPlayersForMode(mode) {
-  const normalized = normalizeMode(mode);
-  return Number(normalized[0]) * 2;
+  const parts = normalizeMode(mode).split("v");
+  return Number(parts[0]) * parts.length;
 }
 
 function sanitizeSkin(skin) {
