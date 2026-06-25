@@ -1,16 +1,17 @@
 # SpaceRocks Windows Relay Server
 
-Das ist der Online-Relay-Server fuer Windows-1v1.
+Das ist der externe Online-Relay-Server fuer SpaceRocks Windows Multiplayer.
+Der Server laeuft auf Render oder einer anderen Webseite/Cloud, nicht auf deinem PC.
 
 Empfohlen fuer einfache Tests: Render Web Service.
 Render Free kann nach Inaktivitaet einschlafen. Wenn der Server wirklich immer online sein soll, nutze Oracle Cloud Always Free oder einen kleinen bezahlten VPS.
 
 ## Render Setup
 
-1. GitHub Repository mit diesem Ordner hochladen.
+1. GitHub Repository mit diesen Dateien hochladen.
 2. Auf Render `New` -> `Web Service`.
 3. Repo auswaehlen.
-4. Root Directory auf `windows_relay_server` setzen.
+4. Root Directory leer lassen, wenn `package.json` direkt im Repo-Root liegt.
 5. Build Command: `npm install`
 6. Start Command: `npm start`
 7. Plan: Free.
@@ -25,6 +26,29 @@ global.mp_relay_secure = true;
 ```
 
 Free Services koennen einschlafen. Beim ersten Join/Host kann es ein paar Sekunden dauern, bis Render wach ist.
+
+## Funktionen
+
+- Host/Join per Code
+- Spieler suchen ohne Code ueber `Quick Match`
+- Lobby-Liste im Spiel ueber `/lobbies`
+- Server-Wakeup/Status ueber `/health`
+- Update-Check ueber `/latest-version`
+- Reconnect ueber gespeicherten Match-Token
+- Match-History ueber `/history`
+
+## Versionen
+
+Der Server nutzt diese Variablen:
+
+```bash
+SPACEROCKS_LATEST_VERSION=1.0.2
+SPACEROCKS_MIN_CLIENT_VERSION=1.0.2
+SPACEROCKS_RELEASE_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest
+SPACEROCKS_DOWNLOAD_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest
+```
+
+Wenn `MIN_CLIENT_VERSION` hoeher ist als die Spielversion, blockt der Server den alten Client.
 
 ## Immer online
 

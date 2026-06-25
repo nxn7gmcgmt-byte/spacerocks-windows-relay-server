@@ -4,10 +4,17 @@ const WebSocket = require("ws");
 const PORT = Number(process.env.PORT || 10000);
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_TTL_MS = 1000 * 60 * 60;
+const RECONNECT_TTL_MS = 1000 * 60 * 3;
+const HISTORY_LIMIT = 50;
 const MAX_TEAM_SIZE = 10;
-const MAX_PLAYERS = 20;
+const MAX_PLAYERS = 30;
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.2";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.2";
+const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
+const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 
 const rooms = new Map();
+const matchHistory = [];
 
 function makeCode() {
   let code = "";
@@ -23,6 +30,40 @@ function makeUniqueCode() {
     if (!rooms.has(code)) return code;
   }
   return makeCode();
+}
+
+function makeToken() {
+  return `${makeCode()}-${makeCode()}-${Date.now().toString(36).toUpperCase()}`;
+}
+
+function compareVersion(a, b) {
+  const left = String(a || "0").replace(/^v/i, "").split(".").map((part) => Number(part) || 0);
+  const right = String(b || "0").replace(/^v/i, "").split(".").map((part) => Number(part) || 0);
+  const len = Math.max(left.length, right.length, 3);
+
+  for (let i = 0; i < len; i += 1) {
+    const l = left[i] || 0;
+    const r = right[i] || 0;
+    if (l > r) return 1;
+    if (l < r) return -1;
+  }
+
+  return 0;
+}
+
+function clientVersionOk(version) {
+  return compareVersion(version || "0", MIN_CLIENT_VERSION) >= 0;
+}
+
+function rejectOldClient(ws) {
+  send(ws, {
+    cmd: "update_required",
+    message: `Bitte update SpaceRocks auf ${LATEST_VERSION}.`,
+    latest_version: LATEST_VERSION,
+    min_version: MIN_CLIENT_VERSION,
+    release_url: RELEASE_URL,
+    download_url: DOWNLOAD_URL
+  });
 }
 
 function normalizeMode(mode) {
@@ -82,7 +123,7 @@ function clearClosedPlayers(room) {
     const player = room.players[i];
     if (player && player.readyState !== WebSocket.OPEN) {
       room.players[i] = null;
-      room.skins[i] = 0;
+      if (room.disconnectedUntil) room.disconnectedUntil[i] = Math.max(room.disconnectedUntil[i] || 0, Date.now() + RECONNECT_TTL_MS);
     }
   }
 }
@@ -105,7 +146,9 @@ function sendRoomStatus(room, cmd = "lobby_update") {
       mode: room.mode,
       connected_players: count,
       required_players: room.maxPlayers,
-      skins: room.skins
+      skins: room.skins,
+      state: room.state,
+      token: player.reconnectToken || ""
     });
   }
 }
@@ -113,6 +156,7 @@ function sendRoomStatus(room, cmd = "lobby_update") {
 function startRoomIfReady(room) {
   clearClosedPlayers(room);
   if (connectedCount(room) < room.maxPlayers) return;
+  room.state = "playing";
 
   for (const player of roomPlayers(room)) {
     send(player, {
@@ -122,7 +166,9 @@ function startRoomIfReady(room) {
       mode: room.mode,
       connected_players: room.maxPlayers,
       required_players: room.maxPlayers,
-      skins: room.skins
+      skins: room.skins,
+      state: room.state,
+      token: player.reconnectToken || ""
     });
   }
 }
@@ -138,20 +184,186 @@ function findOpenSlot(room) {
 function cleanupExpiredRooms() {
   const now = Date.now();
   for (const [code, room] of rooms) {
-    if (room.expiresAt <= now) {
+    const players = connectedCount(room);
+    const reconnectOpen = room.disconnectedUntil && room.disconnectedUntil.some((time) => time > now);
+
+    if (room.expiresAt <= now || (players <= 0 && !reconnectOpen && now - room.createdAt > RECONNECT_TTL_MS)) {
       broadcastRoom(room, { cmd: "error", message: "Code expired." });
       rooms.delete(code);
     }
   }
 }
 
+function lobbySummary(room) {
+  clearClosedPlayers(room);
+  const count = connectedCount(room);
+
+  return {
+    code: room.code,
+    mode: room.mode,
+    state: room.state,
+    connected_players: count,
+    required_players: room.maxPlayers,
+    open_slots: Math.max(0, room.maxPlayers - count),
+    created_at: room.createdAt,
+    expires_in_ms: Math.max(0, room.expiresAt - Date.now())
+  };
+}
+
+function openLobbies(mode = "") {
+  cleanupExpiredRooms();
+  const wantedMode = mode ? normalizeMode(mode) : "";
+
+  return Array.from(rooms.values())
+    .filter((room) => room.state === "open")
+    .filter((room) => !wantedMode || room.mode === wantedMode)
+    .map(lobbySummary)
+    .filter((room) => room.open_slots > 0 && room.expires_in_ms > 0)
+    .sort((a, b) => a.created_at - b.created_at);
+}
+
+function createRoomForHost(ws, msg) {
+  cleanupExpiredRooms();
+
+  const mode = normalizeMode(msg.mode);
+  const code = makeUniqueCode();
+  const maxPlayers = requiredPlayersForMode(mode);
+  const players = Array(maxPlayers).fill(null);
+  const skins = Array(maxPlayers).fill(0);
+  const tokens = Array(maxPlayers).fill("");
+  const disconnectedUntil = Array(maxPlayers).fill(0);
+
+  ws.playerId = 0;
+  ws.roomCode = code;
+  ws.skin = sanitizeSkin(msg.skin);
+  ws.reconnectToken = makeToken();
+  players[0] = ws;
+  skins[0] = ws.skin;
+  tokens[0] = ws.reconnectToken;
+
+  const room = {
+    code,
+    mode,
+    maxPlayers,
+    players,
+    skins,
+    tokens,
+    disconnectedUntil,
+    state: "open",
+    createdAt: Date.now(),
+    expiresAt: Date.now() + CODE_TTL_MS
+  };
+
+  rooms.set(code, room);
+  send(ws, {
+    cmd: "hosted",
+    code,
+    player: 0,
+    mode,
+    connected_players: 1,
+    required_players: maxPlayers,
+    skins,
+    state: room.state,
+    token: ws.reconnectToken
+  });
+
+  return room;
+}
+
+function joinRoom(ws, room, msg, cmd = "lobby") {
+  const slot = findOpenSlot(room);
+  if (slot < 0) {
+    send(ws, { cmd: "error", message: "Room is full." });
+    return false;
+  }
+
+  ws.playerId = slot;
+  ws.roomCode = room.code;
+  ws.skin = sanitizeSkin(msg.skin);
+  ws.reconnectToken = makeToken();
+  room.players[slot] = ws;
+  room.skins[slot] = ws.skin;
+  room.tokens[slot] = ws.reconnectToken;
+  room.disconnectedUntil[slot] = 0;
+
+  send(ws, {
+    cmd,
+    code: room.code,
+    player: slot,
+    mode: room.mode,
+    connected_players: connectedCount(room),
+    required_players: room.maxPlayers,
+    skins: room.skins,
+    state: room.state,
+    token: ws.reconnectToken
+  });
+
+  sendRoomStatus(room);
+  startRoomIfReady(room);
+  return true;
+}
+
+function saveMatchResult(room, msg) {
+  const result = {
+    code: room ? room.code : String(msg.code || ""),
+    mode: room ? room.mode : normalizeMode(msg.mode),
+    winner_team: Number.isFinite(Number(msg.winner_team)) ? Number(msg.winner_team) : -1,
+    duration_seconds: Math.max(0, Math.floor(Number(msg.duration_seconds || 0))),
+    team_wins: Array.isArray(msg.team_wins) ? msg.team_wins.slice(0, 3) : [],
+    players: Array.isArray(msg.players) ? msg.players.slice(0, MAX_PLAYERS) : [],
+    created_at: new Date().toISOString()
+  };
+
+  matchHistory.unshift(result);
+  while (matchHistory.length > HISTORY_LIMIT) matchHistory.pop();
+  return result;
+}
+
 const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+  if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       ok: true,
       rooms: rooms.size,
-      players: Array.from(rooms.values()).reduce((sum, room) => sum + connectedCount(room), 0)
+      open_rooms: openLobbies().length,
+      players: Array.from(rooms.values()).reduce((sum, room) => sum + connectedCount(room), 0),
+      latest_version: LATEST_VERSION,
+      min_client_version: MIN_CLIENT_VERSION,
+      release_url: RELEASE_URL,
+      download_url: DOWNLOAD_URL,
+      uptime_seconds: Math.floor(process.uptime())
+    }));
+    return;
+  }
+
+  if (url.pathname === "/lobbies") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      lobbies: openLobbies(url.searchParams.get("mode") || "")
+    }));
+    return;
+  }
+
+  if (url.pathname === "/history") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      history: matchHistory.slice(0, 20)
+    }));
+    return;
+  }
+
+  if (url.pathname === "/latest-version") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      latest_version: LATEST_VERSION,
+      min_client_version: MIN_CLIENT_VERSION,
+      release_url: RELEASE_URL,
+      download_url: DOWNLOAD_URL
     }));
     return;
   }
@@ -166,6 +378,7 @@ wss.on("connection", (ws) => {
   ws.playerId = -1;
   ws.roomCode = "";
   ws.skin = 0;
+  ws.reconnectToken = "";
 
   ws.on("message", (raw) => {
     const msg = safeJson(String(raw).replace(/\0/g, "").trim());
@@ -175,43 +388,39 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.cmd === "host") {
-      cleanupExpiredRooms();
+      if (!clientVersionOk(msg.version)) {
+        rejectOldClient(ws);
+        return;
+      }
+
+      createRoomForHost(ws, msg);
+      return;
+    }
+
+    if (msg.cmd === "quickjoin") {
+      if (!clientVersionOk(msg.version)) {
+        rejectOldClient(ws);
+        return;
+      }
 
       const mode = normalizeMode(msg.mode);
-      const code = makeUniqueCode();
-      const maxPlayers = requiredPlayersForMode(mode);
-      const players = Array(maxPlayers).fill(null);
-      const skins = Array(maxPlayers).fill(0);
+      const lobby = openLobbies(mode)[0];
 
-      ws.playerId = 0;
-      ws.roomCode = code;
-      ws.skin = sanitizeSkin(msg.skin);
-      players[0] = ws;
-      skins[0] = ws.skin;
+      if (lobby) {
+        const room = rooms.get(lobby.code);
+        if (room && joinRoom(ws, room, msg, "lobby")) return;
+      }
 
-      const room = {
-        code,
-        mode,
-        maxPlayers,
-        players,
-        skins,
-        expiresAt: Date.now() + CODE_TTL_MS
-      };
-
-      rooms.set(code, room);
-      send(ws, {
-        cmd: "hosted",
-        code,
-        player: 0,
-        mode,
-        connected_players: 1,
-        required_players: maxPlayers,
-        skins
-      });
+      createRoomForHost(ws, { ...msg, mode });
       return;
     }
 
     if (msg.cmd === "join") {
+      if (!clientVersionOk(msg.version)) {
+        rejectOldClient(ws);
+        return;
+      }
+
       cleanupExpiredRooms();
 
       const code = String(msg.code || "").toUpperCase();
@@ -228,30 +437,72 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      const slot = findOpenSlot(room);
-      if (slot < 0) {
-        send(ws, { cmd: "error", message: "Room is full." });
+      joinRoom(ws, room, msg, "lobby");
+      return;
+    }
+
+    if (msg.cmd === "reconnect") {
+      if (!clientVersionOk(msg.version)) {
+        rejectOldClient(ws);
+        return;
+      }
+
+      cleanupExpiredRooms();
+
+      const code = String(msg.code || "").toUpperCase();
+      const token = String(msg.token || "");
+      const room = rooms.get(code);
+
+      if (!room || room.expiresAt <= Date.now()) {
+        send(ws, { cmd: room ? "expired" : "not_found", message: room ? "Code expired." : "Code not found." });
+        return;
+      }
+
+      const slot = room.tokens ? room.tokens.indexOf(token) : -1;
+      if (slot < 0 || (room.players[slot] && room.players[slot].readyState === WebSocket.OPEN)) {
+        send(ws, { cmd: "error", message: "Reconnect failed." });
+        return;
+      }
+
+      if (room.disconnectedUntil && room.disconnectedUntil[slot] > 0 && room.disconnectedUntil[slot] < Date.now()) {
+        send(ws, { cmd: "expired", message: "Reconnect expired." });
         return;
       }
 
       ws.playerId = slot;
-      ws.roomCode = code;
+      ws.roomCode = room.code;
       ws.skin = sanitizeSkin(msg.skin);
+      ws.reconnectToken = token;
       room.players[slot] = ws;
       room.skins[slot] = ws.skin;
+      room.disconnectedUntil[slot] = 0;
 
       send(ws, {
-        cmd: "lobby",
-        code,
+        cmd: "reconnected",
+        code: room.code,
         player: slot,
         mode: room.mode,
         connected_players: connectedCount(room),
         required_players: room.maxPlayers,
-        skins: room.skins
+        skins: room.skins,
+        state: room.state,
+        token
       });
 
-      sendRoomStatus(room);
-      startRoomIfReady(room);
+      sendRoomStatus(room, "lobby_update");
+      if (room.state === "playing") {
+        send(ws, {
+          cmd: "start",
+          code: room.code,
+          player: slot,
+          mode: room.mode,
+          connected_players: connectedCount(room),
+          required_players: room.maxPlayers,
+          skins: room.skins,
+          state: room.state,
+          token
+        });
+      }
       return;
     }
 
@@ -274,14 +525,31 @@ wss.on("connection", (ws) => {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
       if (!room || ws.playerId !== 0) return;
       broadcastRoom(room, { cmd: "snapshot", snapshot: msg.snapshot || {} }, ws);
+      return;
+    }
+
+    if (msg.cmd === "match_result") {
+      const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
+      if (!room || ws.playerId !== 0) return;
+      const result = saveMatchResult(room, msg);
+      room.state = "finished";
+      broadcastRoom(room, { cmd: "match_result", result }, null);
     }
   });
 
   ws.on("close", () => {
     const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
     if (!room) return;
-    broadcastRoom(room, { cmd: "peer_left", message: "Player disconnected." }, ws);
-    rooms.delete(ws.roomCode);
+    if (ws.playerId >= 0 && ws.playerId < room.players.length) {
+      room.players[ws.playerId] = null;
+      room.disconnectedUntil[ws.playerId] = Date.now() + RECONNECT_TTL_MS;
+    }
+    broadcastRoom(room, {
+      cmd: "peer_left",
+      player: ws.playerId,
+      reconnect_seconds: Math.floor(RECONNECT_TTL_MS / 1000),
+      message: "Player disconnected. Reconnect is possible for a short time."
+    }, ws);
   });
 });
 
