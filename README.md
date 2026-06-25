@@ -36,14 +36,19 @@ Free Services koennen einschlafen. Beim ersten Join/Host kann es ein paar Sekund
 - Update-Check ueber `/latest-version`
 - Reconnect ueber gespeicherten Match-Token
 - Match-History ueber `/history`
+- Replay-Summaries ueber `/replays`
+- Server-News ueber `/news`
+- Freunde ueber `/friends` und `/friends/add`
+- Invites ueber `/invites`
+- einfacher Cloud-Save ueber `/cloud-save`
 
 ## Versionen
 
 Der Server nutzt diese Variablen:
 
 ```bash
-SPACEROCKS_LATEST_VERSION=1.0.2
-SPACEROCKS_MIN_CLIENT_VERSION=1.0.2
+SPACEROCKS_LATEST_VERSION=1.0.3
+SPACEROCKS_MIN_CLIENT_VERSION=1.0.3
 SPACEROCKS_RELEASE_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest
 SPACEROCKS_DOWNLOAD_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest
 ```

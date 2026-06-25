@@ -8,13 +8,97 @@ const RECONNECT_TTL_MS = 1000 * 60 * 3;
 const HISTORY_LIMIT = 50;
 const MAX_TEAM_SIZE = 10;
 const MAX_PLAYERS = 30;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.2";
-const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.2";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.3";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.3";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 
 const rooms = new Map();
 const matchHistory = [];
+const cloudSaves = new Map();
+const friendLists = new Map();
+const invites = [];
+const replaySummaries = [];
+const serverNews = [
+  {
+    title: "SpaceRocks Online v1.0.3",
+    text: "Online Hub, Lobby-Suche, Cloud-Save, Freunde, Invites, Reconnect, Match-History und adaptive Quick-Bots sind bereit.",
+    created_at: new Date().toISOString()
+  },
+  {
+    title: "Kein PC-Server noetig",
+    text: "Der Relay-Server laeuft extern ueber Render. Dein PC muss nur das Spiel starten.",
+    created_at: new Date().toISOString()
+  }
+];
+
+function sendJson(res, status, body) {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+  });
+  res.end(JSON.stringify(body));
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 1024 * 1024) req.destroy();
+    });
+    req.on("end", () => resolve(data));
+    req.on("error", () => resolve(""));
+  });
+}
+
+async function readJson(req) {
+  const text = await readBody(req);
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+function sanitizeId(id) {
+  return String(id || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, "")
+    .slice(0, 32);
+}
+
+function sanitizeName(name) {
+  return String(name || "SPIELER").replace(/[^\w \-]/g, "").slice(0, 18) || "SPIELER";
+}
+
+function getFriendArray(playerId) {
+  if (!friendLists.has(playerId)) friendLists.set(playerId, []);
+  return friendLists.get(playerId);
+}
+
+function addFriend(playerId, friendId, friendName = "") {
+  const friends = getFriendArray(playerId);
+  if (!friendId || friendId === playerId) return friends;
+  if (!friends.some((friend) => friend.id === friendId)) {
+    friends.push({
+      id: friendId,
+      name: sanitizeName(friendName || friendId),
+      added_at: new Date().toISOString()
+    });
+  }
+  return friends;
+}
+
+function cleanupInvites() {
+  const now = Date.now();
+  for (let i = invites.length - 1; i >= 0; i -= 1) {
+    if (invites[i].expires_at_ms <= now) invites.splice(i, 1);
+  }
+}
 
 function makeCode() {
   let code = "";
@@ -316,15 +400,32 @@ function saveMatchResult(room, msg) {
 
   matchHistory.unshift(result);
   while (matchHistory.length > HISTORY_LIMIT) matchHistory.pop();
+
+  replaySummaries.unshift({
+    id: `${result.code}-${Date.now().toString(36)}`,
+    code: result.code,
+    mode: result.mode,
+    winner_team: result.winner_team,
+    duration_seconds: result.duration_seconds,
+    team_wins: result.team_wins,
+    players: result.players,
+    created_at: result.created_at
+  });
+  while (replaySummaries.length > HISTORY_LIMIT) replaySummaries.pop();
+
   return result;
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
+  if (req.method === "OPTIONS") {
+    sendJson(res, 204, {});
+    return;
+  }
+
   if (url.pathname === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+    sendJson(res, 200, {
       ok: true,
       rooms: rooms.size,
       open_rooms: openLobbies().length,
@@ -334,37 +435,147 @@ const server = http.createServer((req, res) => {
       release_url: RELEASE_URL,
       download_url: DOWNLOAD_URL,
       uptime_seconds: Math.floor(process.uptime())
-    }));
+    });
     return;
   }
 
   if (url.pathname === "/lobbies") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+    sendJson(res, 200, {
       ok: true,
       lobbies: openLobbies(url.searchParams.get("mode") || "")
-    }));
+    });
     return;
   }
 
   if (url.pathname === "/history") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+    sendJson(res, 200, {
       ok: true,
       history: matchHistory.slice(0, 20)
-    }));
+    });
+    return;
+  }
+
+  if (url.pathname === "/replays") {
+    sendJson(res, 200, {
+      ok: true,
+      replays: replaySummaries.slice(0, 20)
+    });
+    return;
+  }
+
+  if (url.pathname === "/news") {
+    sendJson(res, 200, {
+      ok: true,
+      news: serverNews.slice(0, 10)
+    });
+    return;
+  }
+
+  if (url.pathname === "/friends" && req.method === "GET") {
+    const playerId = sanitizeId(url.searchParams.get("player_id"));
+    sendJson(res, 200, {
+      ok: true,
+      player_id: playerId,
+      friends: playerId ? getFriendArray(playerId) : []
+    });
+    return;
+  }
+
+  if (url.pathname === "/friends/add" && req.method === "POST") {
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    const friendId = sanitizeId(body.friend_id);
+
+    if (!playerId || !friendId || playerId === friendId) {
+      sendJson(res, 400, { ok: false, message: "Invalid friend id." });
+      return;
+    }
+
+    const friends = addFriend(playerId, friendId, body.friend_name || friendId);
+    addFriend(friendId, playerId, body.player_name || playerId);
+    sendJson(res, 200, { ok: true, friends });
+    return;
+  }
+
+  if (url.pathname === "/invites" && req.method === "GET") {
+    cleanupInvites();
+    const playerId = sanitizeId(url.searchParams.get("player_id"));
+    sendJson(res, 200, {
+      ok: true,
+      invites: invites.filter((invite) => invite.to_id === playerId).slice(0, 10)
+    });
+    return;
+  }
+
+  if (url.pathname === "/invites" && req.method === "POST") {
+    cleanupInvites();
+    const body = await readJson(req);
+    const fromId = sanitizeId(body.from_id);
+    const toId = sanitizeId(body.to_id);
+    const code = String(body.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+    const mode = normalizeMode(body.mode || "1v1");
+
+    if (!fromId || !toId || !code) {
+      sendJson(res, 400, { ok: false, message: "Invite needs from_id, to_id and code." });
+      return;
+    }
+
+    const invite = {
+      from_id: fromId,
+      from_name: sanitizeName(body.from_name || fromId),
+      to_id: toId,
+      code,
+      mode,
+      created_at: new Date().toISOString(),
+      expires_at_ms: Date.now() + 1000 * 60 * 10
+    };
+
+    invites.unshift(invite);
+    while (invites.length > 100) invites.pop();
+    sendJson(res, 200, { ok: true, invite });
+    return;
+  }
+
+  if (url.pathname === "/cloud-save" && req.method === "GET") {
+    const playerId = sanitizeId(url.searchParams.get("player_id"));
+    const save = playerId ? cloudSaves.get(playerId) : null;
+    if (!save) {
+      sendJson(res, 404, { ok: false, message: "Cloud save not found." });
+      return;
+    }
+
+    sendJson(res, 200, { ok: true, save });
+    return;
+  }
+
+  if (url.pathname === "/cloud-save" && req.method === "POST") {
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    if (!playerId || !body.data || typeof body.data !== "object") {
+      sendJson(res, 400, { ok: false, message: "Cloud save needs player_id and data." });
+      return;
+    }
+
+    const save = {
+      player_id: playerId,
+      player_name: sanitizeName(body.player_name || playerId),
+      data: body.data,
+      updated_at: new Date().toISOString()
+    };
+
+    cloudSaves.set(playerId, save);
+    sendJson(res, 200, { ok: true, save });
     return;
   }
 
   if (url.pathname === "/latest-version") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+    sendJson(res, 200, {
       ok: true,
       latest_version: LATEST_VERSION,
       min_client_version: MIN_CLIENT_VERSION,
       release_url: RELEASE_URL,
       download_url: DOWNLOAD_URL
-    }));
+    });
     return;
   }
 
