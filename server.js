@@ -1,4 +1,5 @@
 const http = require("http");
+const { Readable } = require("stream");
 const WebSocket = require("ws");
 
 const PORT = Number(process.env.PORT || 10000);
@@ -8,10 +9,16 @@ const RECONNECT_TTL_MS = 1000 * 60 * 3;
 const HISTORY_LIMIT = 50;
 const MAX_TEAM_SIZE = 100;
 const MAX_PLAYERS = 200;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.5";
-const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.5";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.6";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.6";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
+const GITHUB_OWNER = process.env.SPACEROCKS_GITHUB_OWNER || "nxn7gmcgmt-byte";
+const GITHUB_REPO = process.env.SPACEROCKS_GITHUB_REPO || "SpaceRocks";
+const GITHUB_TOKEN = process.env.SPACEROCKS_GITHUB_TOKEN || process.env.GITHUB_TOKEN || "";
+const RELEASE_TAG = process.env.SPACEROCKS_RELEASE_TAG || `v${LATEST_VERSION}`;
+const DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_DOWNLOAD_ASSET_NAME || `SpaceRocks-v${LATEST_VERSION}-windows.zip`;
+const USE_RELEASE_PROXY = process.env.SPACEROCKS_USE_RELEASE_PROXY !== "false";
 
 const rooms = new Map();
 const matchHistory = [];
@@ -21,8 +28,8 @@ const invites = [];
 const replaySummaries = [];
 const serverNews = [
   {
-    title: "SpaceRocks Online v1.0.5",
-    text: "Spieler-Anzeige im Online-Match ist jetzt neutraler und sauberer.",
+    title: "SpaceRocks Online v1.0.6",
+    text: "Private GitHub-Downloads laufen jetzt ueber den Render-Server.",
     created_at: new Date().toISOString()
   },
   {
@@ -40,6 +47,150 @@ function sendJson(res, status, body) {
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
   });
   res.end(JSON.stringify(body));
+}
+
+function serverOrigin(req) {
+  if (process.env.SPACEROCKS_PUBLIC_BASE_URL) {
+    return String(process.env.SPACEROCKS_PUBLIC_BASE_URL).replace(/\/+$/g, "");
+  }
+
+  const host = req && req.headers ? req.headers.host : "";
+  let proto = req && req.headers && req.headers["x-forwarded-proto"]
+    ? String(req.headers["x-forwarded-proto"]).split(",")[0].trim()
+    : "https";
+  if ((!req || !req.headers || !req.headers["x-forwarded-proto"]) && (String(host).startsWith("127.0.0.1") || String(host).startsWith("localhost"))) {
+    proto = "http";
+  }
+  return `${proto}://${host || "localhost"}`;
+}
+
+function proxyDownloadUrl(req, tag = RELEASE_TAG, assetName = DOWNLOAD_ASSET_NAME) {
+  return `${serverOrigin(req)}/download/${encodeURIComponent(tag)}/${encodeURIComponent(assetName)}`;
+}
+
+function publicDownloadUrl(req) {
+  if (USE_RELEASE_PROXY) return proxyDownloadUrl(req);
+  return DOWNLOAD_URL;
+}
+
+function githubHeaders(accept) {
+  const headers = {
+    "Accept": accept || "application/vnd.github+json",
+    "User-Agent": "SpaceRocksRelay"
+  };
+  if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+  return headers;
+}
+
+async function fetchGithubJson(path) {
+  const response = await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}${path}`, {
+    headers: githubHeaders("application/vnd.github+json")
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`GitHub API ${response.status}: ${text.slice(0, 160)}`);
+  }
+
+  return response.json();
+}
+
+async function githubReleaseForTag(tag) {
+  const safeTag = String(tag || RELEASE_TAG);
+  if (safeTag === "latest") return fetchGithubJson("/releases/latest");
+  return fetchGithubJson(`/releases/tags/${encodeURIComponent(safeTag)}`);
+}
+
+function launcherReleaseFallback(req) {
+  return {
+    tag_name: RELEASE_TAG,
+    name: `SpaceRocks ${RELEASE_TAG}`,
+    body: "Private GitHub Release. Download laeuft ueber den Render-Server.",
+    html_url: RELEASE_URL,
+    private_release_proxy: true,
+    github_private_access_configured: Boolean(GITHUB_TOKEN),
+    assets: [
+      {
+        name: DOWNLOAD_ASSET_NAME,
+        size: 0,
+        browser_download_url: proxyDownloadUrl(req, RELEASE_TAG, DOWNLOAD_ASSET_NAME)
+      }
+    ]
+  };
+}
+
+async function launcherReleasePayload(req) {
+  try {
+    const release = await githubReleaseForTag("latest");
+    const tag = release.tag_name || RELEASE_TAG;
+    const assets = Array.isArray(release.assets) ? release.assets : [];
+    return {
+      tag_name: tag,
+      name: release.name || `SpaceRocks ${tag}`,
+      body: release.body || "",
+      html_url: release.html_url || RELEASE_URL,
+      private_release_proxy: USE_RELEASE_PROXY,
+      github_private_access_configured: Boolean(GITHUB_TOKEN),
+      assets: assets.map((asset) => ({
+        name: asset.name,
+        size: asset.size || 0,
+        browser_download_url: USE_RELEASE_PROXY
+          ? proxyDownloadUrl(req, tag, asset.name)
+          : asset.browser_download_url
+      }))
+    };
+  } catch (error) {
+    const fallback = launcherReleaseFallback(req);
+    fallback.body += `\n\nGitHub API Fehler: ${error.message}`;
+    return fallback;
+  }
+}
+
+async function streamGithubReleaseAsset(req, res, tag, assetName) {
+  if (!GITHUB_TOKEN) {
+    sendJson(res, 500, {
+      ok: false,
+      message: "Private GitHub downloads brauchen SPACEROCKS_GITHUB_TOKEN auf Render."
+    });
+    return;
+  }
+
+  try {
+    const release = await githubReleaseForTag(tag || RELEASE_TAG);
+    const assets = Array.isArray(release.assets) ? release.assets : [];
+    const wanted = String(assetName || DOWNLOAD_ASSET_NAME).toLowerCase();
+    const asset = assets.find((item) => String(item.name || "").toLowerCase() === wanted)
+      || assets.find((item) => String(item.name || "").toLowerCase().includes("windows") && String(item.name || "").toLowerCase().endsWith(".zip"))
+      || assets.find((item) => String(item.name || "").toLowerCase().endsWith(".zip"));
+
+    if (!asset || !asset.url) {
+      sendJson(res, 404, { ok: false, message: "Release ZIP wurde nicht gefunden." });
+      return;
+    }
+
+    const response = await fetch(asset.url, {
+      redirect: "follow",
+      headers: githubHeaders("application/octet-stream")
+    });
+
+    if (!response.ok || !response.body) {
+      sendJson(res, response.status || 502, { ok: false, message: "GitHub Asset Download fehlgeschlagen." });
+      return;
+    }
+
+    const headers = {
+      "Content-Type": response.headers.get("content-type") || "application/zip",
+      "Content-Disposition": `attachment; filename="${String(asset.name || DOWNLOAD_ASSET_NAME).replace(/"/g, "")}"`,
+      "Access-Control-Allow-Origin": "*"
+    };
+    const length = response.headers.get("content-length") || asset.size;
+    if (length) headers["Content-Length"] = String(length);
+
+    res.writeHead(200, headers);
+    Readable.fromWeb(response.body).pipe(res);
+  } catch (error) {
+    sendJson(res, 500, { ok: false, message: error.message || "Download fehlgeschlagen." });
+  }
 }
 
 function readBody(req) {
@@ -146,7 +297,7 @@ function rejectOldClient(ws) {
     latest_version: LATEST_VERSION,
     min_version: MIN_CLIENT_VERSION,
     release_url: RELEASE_URL,
-    download_url: DOWNLOAD_URL
+    download_url: ws && ws.downloadUrl ? ws.downloadUrl : DOWNLOAD_URL
   });
 }
 
@@ -466,9 +617,24 @@ const server = http.createServer(async (req, res) => {
       latest_version: LATEST_VERSION,
       min_client_version: MIN_CLIENT_VERSION,
       release_url: RELEASE_URL,
-      download_url: DOWNLOAD_URL,
+      download_url: publicDownloadUrl(req),
+      private_release_proxy: USE_RELEASE_PROXY,
+      github_private_access_configured: Boolean(GITHUB_TOKEN),
       uptime_seconds: Math.floor(process.uptime())
     });
+    return;
+  }
+
+  if (url.pathname === "/launcher-release") {
+    sendJson(res, 200, await launcherReleasePayload(req));
+    return;
+  }
+
+  if (url.pathname.startsWith("/download/")) {
+    const parts = url.pathname.split("/").filter(Boolean);
+    const tag = decodeURIComponent(parts[1] || RELEASE_TAG);
+    const assetName = decodeURIComponent(parts.slice(2).join("/") || DOWNLOAD_ASSET_NAME);
+    await streamGithubReleaseAsset(req, res, tag, assetName);
     return;
   }
 
@@ -607,7 +773,9 @@ const server = http.createServer(async (req, res) => {
       latest_version: LATEST_VERSION,
       min_client_version: MIN_CLIENT_VERSION,
       release_url: RELEASE_URL,
-      download_url: DOWNLOAD_URL
+      download_url: publicDownloadUrl(req),
+      private_release_proxy: USE_RELEASE_PROXY,
+      github_private_access_configured: Boolean(GITHUB_TOKEN)
     });
     return;
   }
@@ -618,11 +786,12 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   ws.playerId = -1;
   ws.roomCode = "";
   ws.skin = 0;
   ws.reconnectToken = "";
+  ws.downloadUrl = publicDownloadUrl(req);
 
   ws.on("message", (raw) => {
     const msg = safeJson(String(raw).replace(/\0/g, "").trim());
