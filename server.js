@@ -8,8 +8,8 @@ const RECONNECT_TTL_MS = 1000 * 60 * 3;
 const HISTORY_LIMIT = 50;
 const MAX_TEAM_SIZE = 10;
 const MAX_PLAYERS = 30;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.3";
-const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.3";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.4";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.4";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 
@@ -21,8 +21,8 @@ const invites = [];
 const replaySummaries = [];
 const serverNews = [
   {
-    title: "SpaceRocks Online v1.0.3",
-    text: "Online Hub, Lobby-Suche, Cloud-Save, Freunde, Invites, Reconnect, Match-History und adaptive Quick-Bots sind bereit.",
+    title: "SpaceRocks Online v1.0.4",
+    text: "Pflicht-Updates, gefixte Bot-Profile und Online-Suche mit Bot-Auffuellung sind bereit.",
     created_at: new Date().toISOString()
   },
   {
@@ -202,6 +202,15 @@ function connectedCount(room) {
   return roomPlayers(room).length;
 }
 
+function botCount(room) {
+  if (!room || !Array.isArray(room.botSlots)) return 0;
+  return room.botSlots.filter(Boolean).length;
+}
+
+function occupiedCount(room) {
+  return connectedCount(room) + botCount(room);
+}
+
 function clearClosedPlayers(room) {
   for (let i = 0; i < room.players.length; i += 1) {
     const player = room.players[i];
@@ -221,6 +230,7 @@ function broadcastRoom(room, data, except = null) {
 function sendRoomStatus(room, cmd = "lobby_update") {
   clearClosedPlayers(room);
   const count = connectedCount(room);
+  const bots = botCount(room);
 
   for (const player of roomPlayers(room)) {
     send(player, {
@@ -228,8 +238,11 @@ function sendRoomStatus(room, cmd = "lobby_update") {
       code: room.code,
       player: player.playerId,
       mode: room.mode,
-      connected_players: count,
+      connected_players: count + bots,
+      real_players: count,
+      bot_players: bots,
       required_players: room.maxPlayers,
+      bot_slots: room.botSlots || Array(room.maxPlayers).fill(false),
       skins: room.skins,
       state: room.state,
       token: player.reconnectToken || ""
@@ -239,8 +252,10 @@ function sendRoomStatus(room, cmd = "lobby_update") {
 
 function startRoomIfReady(room) {
   clearClosedPlayers(room);
-  if (connectedCount(room) < room.maxPlayers) return;
+  if (occupiedCount(room) < room.maxPlayers) return;
   room.state = "playing";
+  const real = connectedCount(room);
+  const bots = botCount(room);
 
   for (const player of roomPlayers(room)) {
     send(player, {
@@ -248,8 +263,11 @@ function startRoomIfReady(room) {
       code: room.code,
       player: player.playerId,
       mode: room.mode,
-      connected_players: room.maxPlayers,
+      connected_players: real + bots,
+      real_players: real,
+      bot_players: bots,
       required_players: room.maxPlayers,
+      bot_slots: room.botSlots || Array(room.maxPlayers).fill(false),
       skins: room.skins,
       state: room.state,
       token: player.reconnectToken || ""
@@ -260,9 +278,21 @@ function startRoomIfReady(room) {
 function findOpenSlot(room) {
   clearClosedPlayers(room);
   for (let i = 0; i < room.maxPlayers; i += 1) {
-    if (!room.players[i]) return i;
+    if (!room.players[i] && !(room.botSlots && room.botSlots[i])) return i;
   }
   return -1;
+}
+
+function fillRoomWithBots(room) {
+  if (!room || room.state === "playing") return;
+  clearClosedPlayers(room);
+  if (!Array.isArray(room.botSlots)) room.botSlots = Array(room.maxPlayers).fill(false);
+
+  for (let i = 0; i < room.maxPlayers; i += 1) {
+    if (!room.players[i]) room.botSlots[i] = true;
+  }
+
+  startRoomIfReady(room);
 }
 
 function cleanupExpiredRooms() {
@@ -281,14 +311,17 @@ function cleanupExpiredRooms() {
 function lobbySummary(room) {
   clearClosedPlayers(room);
   const count = connectedCount(room);
+  const bots = botCount(room);
 
   return {
     code: room.code,
     mode: room.mode,
     state: room.state,
-    connected_players: count,
+    connected_players: count + bots,
+    real_players: count,
+    bot_players: bots,
     required_players: room.maxPlayers,
-    open_slots: Math.max(0, room.maxPlayers - count),
+    open_slots: Math.max(0, room.maxPlayers - count - bots),
     created_at: room.createdAt,
     expires_in_ms: Math.max(0, room.expiresAt - Date.now())
   };
@@ -316,6 +349,7 @@ function createRoomForHost(ws, msg) {
   const skins = Array(maxPlayers).fill(0);
   const tokens = Array(maxPlayers).fill("");
   const disconnectedUntil = Array(maxPlayers).fill(0);
+  const botSlots = Array(maxPlayers).fill(false);
 
   ws.playerId = 0;
   ws.roomCode = code;
@@ -333,6 +367,7 @@ function createRoomForHost(ws, msg) {
     skins,
     tokens,
     disconnectedUntil,
+    botSlots,
     state: "open",
     createdAt: Date.now(),
     expiresAt: Date.now() + CODE_TTL_MS
@@ -345,7 +380,10 @@ function createRoomForHost(ws, msg) {
     player: 0,
     mode,
     connected_players: 1,
+    real_players: 1,
+    bot_players: 0,
     required_players: maxPlayers,
+    bot_slots: botSlots,
     skins,
     state: room.state,
     token: ws.reconnectToken
@@ -366,17 +404,23 @@ function joinRoom(ws, room, msg, cmd = "lobby") {
   ws.skin = sanitizeSkin(msg.skin);
   ws.reconnectToken = makeToken();
   room.players[slot] = ws;
+  if (room.botSlots) room.botSlots[slot] = false;
   room.skins[slot] = ws.skin;
   room.tokens[slot] = ws.reconnectToken;
   room.disconnectedUntil[slot] = 0;
+  const real = connectedCount(room);
+  const bots = botCount(room);
 
   send(ws, {
     cmd,
     code: room.code,
     player: slot,
     mode: room.mode,
-    connected_players: connectedCount(room),
+    connected_players: real + bots,
+    real_players: real,
+    bot_players: bots,
     required_players: room.maxPlayers,
+    bot_slots: room.botSlots || Array(room.maxPlayers).fill(false),
     skins: room.skins,
     state: room.state,
     token: ws.reconnectToken
@@ -619,10 +663,14 @@ wss.on("connection", (ws) => {
 
       if (lobby) {
         const room = rooms.get(lobby.code);
-        if (room && joinRoom(ws, room, msg, "lobby")) return;
+        if (room && joinRoom(ws, room, msg, "lobby")) {
+          fillRoomWithBots(room);
+          return;
+        }
       }
 
-      createRoomForHost(ws, { ...msg, mode });
+      const room = createRoomForHost(ws, { ...msg, mode });
+      fillRoomWithBots(room);
       return;
     }
 
@@ -685,16 +733,22 @@ wss.on("connection", (ws) => {
       ws.skin = sanitizeSkin(msg.skin);
       ws.reconnectToken = token;
       room.players[slot] = ws;
+      if (room.botSlots) room.botSlots[slot] = false;
       room.skins[slot] = ws.skin;
       room.disconnectedUntil[slot] = 0;
+      const real = connectedCount(room);
+      const bots = botCount(room);
 
       send(ws, {
         cmd: "reconnected",
         code: room.code,
         player: slot,
         mode: room.mode,
-        connected_players: connectedCount(room),
+        connected_players: real + bots,
+        real_players: real,
+        bot_players: bots,
         required_players: room.maxPlayers,
+        bot_slots: room.botSlots || Array(room.maxPlayers).fill(false),
         skins: room.skins,
         state: room.state,
         token
@@ -707,8 +761,11 @@ wss.on("connection", (ws) => {
           code: room.code,
           player: slot,
           mode: room.mode,
-          connected_players: connectedCount(room),
+          connected_players: real + bots,
+          real_players: real,
+          bot_players: bots,
           required_players: room.maxPlayers,
+          bot_slots: room.botSlots || Array(room.maxPlayers).fill(false),
           skins: room.skins,
           state: room.state,
           token
@@ -722,6 +779,15 @@ wss.on("connection", (ws) => {
       if (!room || ws.playerId < 0) return;
       room.skins[ws.playerId] = sanitizeSkin(msg.skin);
       sendRoomStatus(room);
+      return;
+    }
+
+    if (msg.cmd === "bot_input") {
+      const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
+      if (!room || ws.playerId !== 0) return;
+      const botPlayer = Math.max(0, Math.min(room.maxPlayers - 1, Math.floor(Number(msg.player || 0))));
+      if (!room.botSlots || !room.botSlots[botPlayer]) return;
+      broadcastRoom(room, { cmd: "input", player: botPlayer, input: msg.input || {}, frame: msg.frame || 0 }, ws);
       return;
     }
 
