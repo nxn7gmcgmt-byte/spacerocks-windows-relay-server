@@ -50,8 +50,8 @@ Free Services koennen einschlafen. Beim ersten Join/Host kann es ein paar Sekund
 Der Server nutzt diese Variablen:
 
 ```bash
-SPACEROCKS_LATEST_VERSION=1.0.7
-SPACEROCKS_MIN_CLIENT_VERSION=1.0.6
+SPACEROCKS_LATEST_VERSION=1.0.8
+SPACEROCKS_MIN_CLIENT_VERSION=1.0.8
 SPACEROCKS_RELEASE_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest
 SPACEROCKS_DOWNLOAD_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest
 SPACEROCKS_GITHUB_TOKEN=DEIN_PRIVATE_REPO_READ_TOKEN
