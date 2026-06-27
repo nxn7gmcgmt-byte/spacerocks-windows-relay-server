@@ -838,7 +838,7 @@ const server = http.createServer(async (req, res) => {
     cleanScoreSessions();
     const body = await readJson(req);
     const gameVersion = String(body.game_version || "0").trim();
-    if (!versionAllowed(gameVersion)) {
+    if (!clientVersionOk(gameVersion)) {
       sendJson(res, 426, {
         ok: false,
         message: `SpaceRocks ${MIN_CLIENT_VERSION} or newer is required.`,
