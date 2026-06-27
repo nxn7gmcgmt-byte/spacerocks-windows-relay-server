@@ -9,6 +9,10 @@ const CODE_TTL_MS = 1000 * 60 * 60;
 const RECONNECT_TTL_MS = 1000 * 60 * 3;
 const QUICK_MATCH_WAIT_MS = 2500;
 const HISTORY_LIMIT = 50;
+const PLAYER_REPLAY_LIMIT = 10;
+const REPLAY_STORE_LIMIT = 100;
+const REPLAY_MAX_FRAMES = 1800;
+const MAX_SPECTATORS_PER_MATCH = 32;
 const MAX_TEAM_SIZE = 100;
 const MAX_PLAYERS = 200;
 const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.8";
@@ -22,6 +26,19 @@ const RELEASE_TAG = process.env.SPACEROCKS_RELEASE_TAG || `v${LATEST_VERSION}`;
 const DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_DOWNLOAD_ASSET_NAME || `SpaceRocks-v${LATEST_VERSION}-windows.zip`;
 const USE_RELEASE_PROXY = process.env.SPACEROCKS_USE_RELEASE_PROXY !== "false";
 const OWNER_SECRET = process.env.SPACEROCKS_OWNER_SECRET || "";
+const OWNER_PLAYER_ID = String(process.env.SPACEROCKS_OWNER_PLAYER_ID || "").toUpperCase();
+const OWNER_ACCOUNT = String(process.env.SPACEROCKS_OWNER_ACCOUNT || "").toLowerCase();
+const SEEDED_BANS = process.env.SPACEROCKS_BANNED_PLAYERS || "";
+const GOOGLE_CLIENT_ID = process.env.SPACEROCKS_GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.SPACEROCKS_GOOGLE_CLIENT_SECRET || "";
+const APPLE_CLIENT_ID = process.env.SPACEROCKS_APPLE_CLIENT_ID || "";
+const APPLE_TEAM_ID = process.env.SPACEROCKS_APPLE_TEAM_ID || "";
+const APPLE_KEY_ID = process.env.SPACEROCKS_APPLE_KEY_ID || "";
+const APPLE_PRIVATE_KEY = String(process.env.SPACEROCKS_APPLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+const APPLE_CLIENT_SECRET = process.env.SPACEROCKS_APPLE_CLIENT_SECRET || "";
+const AUTH_REQUIRED = process.env.SPACEROCKS_AUTH_REQUIRED === "true";
+const AUTH_REQUEST_TTL_MS = 1000 * 60 * 10;
+const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 const SCORE_SESSION_TTL_MS = 1000 * 60 * 60 * 6;
 const SCORE_MAX_SUBMISSIONS = 260;
 
@@ -32,6 +49,11 @@ const cloudSaves = new Map();
 const friendLists = new Map();
 const invites = [];
 const replaySummaries = [];
+const replayStore = new Map();
+const replayByPlayer = new Map();
+const bannedPlayers = new Map();
+const authRequests = new Map();
+const authSessions = new Map();
 const serverNews = [
   {
     title: "Geschuetzte Online-Bestenlisten",
@@ -142,7 +164,7 @@ function sendJson(res, status, body) {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
   });
   res.end(JSON.stringify(body));
@@ -332,6 +354,273 @@ function ownerSecretMatches(value) {
   return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
 }
 
+function ownerAccountMatches(ws) {
+  if (!ws) return false;
+  if (OWNER_ACCOUNT) {
+    const accountId = String(ws.accountId || "").toLowerCase();
+    const accountEmail = String(ws.accountEmail || "").toLowerCase();
+    return accountId === OWNER_ACCOUNT || accountEmail === OWNER_ACCOUNT;
+  }
+  const safeId = sanitizeId(ws.onlineId);
+  return Boolean(OWNER_PLAYER_ID) && safeId === sanitizeId(OWNER_PLAYER_ID);
+}
+
+function cleanAuthState() {
+  const now = Date.now();
+  for (const [state, request] of authRequests.entries()) {
+    if (!request || now - request.createdAt > AUTH_REQUEST_TTL_MS) authRequests.delete(state);
+  }
+  for (const [token, session] of authSessions.entries()) {
+    if (!session || now - session.createdAt > AUTH_SESSION_TTL_MS) authSessions.delete(token);
+  }
+}
+
+function authSessionForToken(token) {
+  cleanAuthState();
+  return authSessions.get(String(token || "")) || null;
+}
+
+function accountOnlineId(session) {
+  if (!session) return "";
+  return sanitizeId(`${session.provider === "apple" ? "A" : "G"}${session.provider_id || session.account_id}`);
+}
+
+function requestAuthContext(req, requestedPlayerId = "") {
+  const authorization = String((req && req.headers && req.headers.authorization) || "");
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  const session = authSessionForToken(match ? match[1] : "");
+  if (session) return { session, playerId: accountOnlineId(session) };
+  if (!AUTH_REQUIRED) return { session: null, playerId: sanitizeId(requestedPlayerId) };
+  return null;
+}
+
+function requireRequestAuth(req, res, requestedPlayerId = "") {
+  const context = requestAuthContext(req, requestedPlayerId);
+  if (context) return context;
+  sendJson(res, 401, { ok: false, message: "Bitte zuerst mit Google oder Apple anmelden." });
+  return null;
+}
+
+function authenticateSocket(ws, msg) {
+  applyConnectionIdentity(ws, msg);
+  const session = authSessionForToken(msg && msg.auth_token);
+  if (session) {
+    ws.authToken = String(msg.auth_token);
+    ws.accountId = String(session.account_id || "");
+    ws.accountEmail = String(session.email || "");
+    ws.playerName = sanitizeName(session.name || ws.playerName);
+    ws.onlineId = accountOnlineId(session);
+    return true;
+  }
+  if (!AUTH_REQUIRED) {
+    ws.accountId = ws.onlineId || "guest";
+    return true;
+  }
+  send(ws, { cmd: "auth_required", message: "Bitte zuerst mit Google oder Apple anmelden." });
+  return false;
+}
+
+function googleAuthConfigured() {
+  return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+}
+
+function appleAuthConfigured() {
+  return Boolean(APPLE_CLIENT_ID && (APPLE_CLIENT_SECRET || (APPLE_TEAM_ID && APPLE_KEY_ID && APPLE_PRIVATE_KEY)));
+}
+
+function base64Url(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function appleClientSecret() {
+  if (APPLE_CLIENT_SECRET) return APPLE_CLIENT_SECRET;
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64Url(JSON.stringify({ alg: "ES256", kid: APPLE_KEY_ID }));
+  const payload = base64Url(JSON.stringify({
+    iss: APPLE_TEAM_ID,
+    iat: now,
+    exp: now + 60 * 60 * 24 * 30,
+    aud: "https://appleid.apple.com",
+    sub: APPLE_CLIENT_ID
+  }));
+  const signingInput = `${header}.${payload}`;
+  const signature = crypto.sign("sha256", Buffer.from(signingInput), {
+    key: APPLE_PRIVATE_KEY,
+    dsaEncoding: "ieee-p1363"
+  });
+  return `${signingInput}.${signature.toString("base64url")}`;
+}
+
+function decodeJwtPart(value) {
+  try { return JSON.parse(Buffer.from(String(value || ""), "base64url").toString("utf8")); } catch { return {}; }
+}
+
+async function verifyAppleIdToken(idToken) {
+  const parts = String(idToken || "").split(".");
+  if (parts.length !== 3) throw new Error("Apple identity token is invalid.");
+  const header = decodeJwtPart(parts[0]);
+  const claims = decodeJwtPart(parts[1]);
+  const keysResponse = await fetch("https://appleid.apple.com/auth/keys");
+  const keysData = await keysResponse.json().catch(() => ({}));
+  const jwk = Array.isArray(keysData.keys) ? keysData.keys.find((key) => key.kid === header.kid) : null;
+  if (!jwk) throw new Error("Apple signing key was not found.");
+  const publicKey = crypto.createPublicKey({ key: jwk, format: "jwk" });
+  const verified = crypto.verify(
+    "RSA-SHA256",
+    Buffer.from(`${parts[0]}.${parts[1]}`),
+    publicKey,
+    Buffer.from(parts[2], "base64url")
+  );
+  const now = Math.floor(Date.now() / 1000);
+  if (!verified || claims.iss !== "https://appleid.apple.com" || claims.aud !== APPLE_CLIENT_ID || Number(claims.exp || 0) <= now) {
+    throw new Error("Apple identity verification failed.");
+  }
+  return claims;
+}
+
+async function exchangeGoogleCode(code, redirectUri) {
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code: String(code || ""),
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code"
+    })
+  });
+  const tokenData = await tokenResponse.json().catch(() => ({}));
+  if (!tokenResponse.ok || !tokenData.id_token) throw new Error("Google token exchange failed.");
+
+  const verifyResponse = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(tokenData.id_token)}`);
+  const profile = await verifyResponse.json().catch(() => ({}));
+  if (!verifyResponse.ok || String(profile.aud || "") !== GOOGLE_CLIENT_ID || !profile.sub) {
+    throw new Error("Google identity verification failed.");
+  }
+  return {
+    provider: "google",
+    provider_id: String(profile.sub),
+    account_id: `google:${profile.sub}`,
+    email: String(profile.email || "").toLowerCase(),
+    name: sanitizeName(profile.name || profile.email || "SPIELER")
+  };
+}
+
+async function exchangeAppleCode(code, redirectUri, suppliedUser = "") {
+  const tokenResponse = await fetch("https://appleid.apple.com/auth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code: String(code || ""),
+      client_id: APPLE_CLIENT_ID,
+      client_secret: appleClientSecret(),
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code"
+    })
+  });
+  const tokenData = await tokenResponse.json().catch(() => ({}));
+  if (!tokenResponse.ok || !tokenData.id_token) throw new Error("Apple token exchange failed.");
+  const claims = await verifyAppleIdToken(tokenData.id_token);
+  let suppliedName = "";
+  try {
+    const user = JSON.parse(String(suppliedUser || "{}"));
+    suppliedName = [user.name && user.name.firstName, user.name && user.name.lastName].filter(Boolean).join(" ");
+  } catch {}
+  return {
+    provider: "apple",
+    provider_id: String(claims.sub),
+    account_id: `apple:${claims.sub}`,
+    email: String(claims.email || "").toLowerCase(),
+    name: sanitizeName(suppliedName || claims.email || "SPIELER")
+  };
+}
+
+function connectionIpHash(ws) {
+  const source = String((ws && ws.remoteAddress) || "");
+  if (!source) return "";
+  return crypto.createHash("sha256").update(source).digest("hex").slice(0, 24);
+}
+
+function applyConnectionIdentity(ws, msg) {
+  if (!ws) return;
+  const onlineId = sanitizeId(msg && msg.player_id);
+  const playerName = sanitizeName(msg && msg.player_name);
+  if (onlineId) ws.onlineId = onlineId;
+  if (playerName) ws.playerName = playerName;
+  if (!ws.ipHash) ws.ipHash = connectionIpHash(ws);
+}
+
+function banRecordFor(ws, msg = {}) {
+  const onlineId = sanitizeId((msg && msg.player_id) || (ws && ws.onlineId));
+  const ipHash = (ws && ws.ipHash) || connectionIpHash(ws);
+  if (onlineId && bannedPlayers.has(`ID:${onlineId}`)) return bannedPlayers.get(`ID:${onlineId}`);
+  if (ipHash && bannedPlayers.has(`IP:${ipHash}`)) return bannedPlayers.get(`IP:${ipHash}`);
+  return null;
+}
+
+function rejectBannedConnection(ws, msg = {}) {
+  applyConnectionIdentity(ws, msg);
+  const record = banRecordFor(ws, msg);
+  if (!record) return false;
+  send(ws, {
+    cmd: "banned",
+    message: record.reason ? `Gebannt: ${record.reason}` : "Dieser Account wurde vom Owner gebannt."
+  });
+  setTimeout(() => {
+    try { ws.close(4003, "Banned by owner"); } catch {}
+  }, 20);
+  return true;
+}
+
+function addPlayerBan(target, reason, ownerId) {
+  if (!target) return null;
+  const onlineId = sanitizeId(target.onlineId);
+  const ipHash = target.ipHash || connectionIpHash(target);
+  const record = {
+    player_id: onlineId,
+    player_name: sanitizeName(target.playerName || onlineId || "SPIELER"),
+    reason: String(reason || "Vom Owner gebannt.").replace(/[^\w \-!?.,:]/g, "").slice(0, 80),
+    owner_id: sanitizeId(ownerId),
+    created_at: new Date().toISOString()
+  };
+  if (onlineId) bannedPlayers.set(`ID:${onlineId}`, record);
+  if (ipHash) bannedPlayers.set(`IP:${ipHash}`, record);
+  return record;
+}
+
+function removePlayerBan(playerId) {
+  const safeId = sanitizeId(playerId);
+  if (!safeId) return false;
+  const record = bannedPlayers.get(`ID:${safeId}`);
+  if (!record) return false;
+  for (const [key, value] of bannedPlayers.entries()) {
+    if (value === record || sanitizeId(value && value.player_id) === safeId) bannedPlayers.delete(key);
+  }
+  return true;
+}
+
+function publicBanList() {
+  const unique = new Map();
+  for (const record of bannedPlayers.values()) {
+    if (record && record.player_id) unique.set(record.player_id, record);
+  }
+  return Array.from(unique.values()).slice(0, 50);
+}
+
+for (const seededId of String(SEEDED_BANS).split(",")) {
+  const safeId = sanitizeId(seededId);
+  if (safeId) {
+    bannedPlayers.set(`ID:${safeId}`, {
+      player_id: safeId,
+      player_name: safeId,
+      reason: "Server ban",
+      owner_id: sanitizeId(OWNER_PLAYER_ID),
+      created_at: new Date().toISOString()
+    });
+  }
+}
+
 function getFriendArray(playerId) {
   if (!friendLists.has(playerId)) friendLists.set(playerId, []);
   return friendLists.get(playerId);
@@ -405,6 +694,16 @@ function rejectOldClient(ws) {
     release_url: RELEASE_URL,
     download_url: ws && ws.downloadUrl ? ws.downloadUrl : DOWNLOAD_URL
   });
+}
+
+function allowOnlineEntry(ws, msg) {
+  if (!clientVersionOk(msg && msg.version)) {
+    rejectOldClient(ws);
+    return false;
+  }
+  if (!authenticateSocket(ws, msg)) return false;
+  if (rejectBannedConnection(ws, msg)) return false;
+  return true;
 }
 
 function normalizeMode(mode) {
@@ -509,6 +808,75 @@ function broadcastRoom(room, data, except = null) {
   }
 }
 
+function roomSpectators(room) {
+  if (!room || !(room.spectators instanceof Set)) return [];
+  const active = [];
+  for (const spectator of room.spectators) {
+    if (spectator && spectator.readyState === WebSocket.OPEN) active.push(spectator);
+    else room.spectators.delete(spectator);
+  }
+  return active;
+}
+
+function broadcastSpectators(room, data) {
+  for (const spectator of roomSpectators(room)) send(spectator, data);
+}
+
+function resetRoomReplay(room) {
+  if (!room) return;
+  room.replayFrames = [];
+  room.replayHighlights = [];
+  room.replayStride = 1;
+  room.replaySnapshotCount = 0;
+  room.replayLastKills = [];
+  room.replayLastRoundWinner = -1;
+  room.latestSnapshot = null;
+  room.matchStartedAt = Date.now();
+}
+
+function recordRoomSnapshot(room, snapshot) {
+  if (!room || !snapshot || typeof snapshot !== "object") return;
+  if (!Array.isArray(room.replayFrames)) resetRoomReplay(room);
+
+  room.latestSnapshot = snapshot;
+  room.replaySnapshotCount += 1;
+  const elapsed = Math.max(0, Date.now() - (room.matchStartedAt || Date.now()));
+  const snapshotPlayers = Array.isArray(snapshot.players) ? snapshot.players : [];
+
+  for (let slot = 0; slot < snapshotPlayers.length; slot += 1) {
+    const kills = Math.max(0, Math.floor(Number(snapshotPlayers[slot] && snapshotPlayers[slot].kills || 0)));
+    const previous = Math.max(0, Math.floor(Number(room.replayLastKills[slot] || 0)));
+    if (kills > previous) {
+      room.replayHighlights.push({
+        type: "kill",
+        t_ms: elapsed,
+        player: slot,
+        team: teamForSlot(room, slot),
+        label: `${room.slotNames[slot] || `P${slot + 1}`} erzielt einen Abschuss`
+      });
+    }
+    room.replayLastKills[slot] = kills;
+  }
+
+  const roundWinner = Math.floor(Number(snapshot.round_winner_team || -1));
+  if (roundWinner >= 0 && roundWinner !== room.replayLastRoundWinner) {
+    room.replayHighlights.push({
+      type: "round",
+      t_ms: elapsed,
+      team: roundWinner,
+      label: `Team ${roundWinner + 1} gewinnt die Runde`
+    });
+  }
+  room.replayLastRoundWinner = roundWinner;
+
+  if (room.replaySnapshotCount % room.replayStride !== 0) return;
+  if (room.replayFrames.length >= REPLAY_MAX_FRAMES) {
+    room.replayFrames = room.replayFrames.filter((_, index) => index % 2 === 0);
+    room.replayStride *= 2;
+  }
+  room.replayFrames.push({ t_ms: elapsed, snapshot });
+}
+
 function privateBotSlotsFor(room, player) {
   if (!room || !Array.isArray(room.botSlots)) return Array(room ? room.maxPlayers : 0).fill(false);
   return player && player.playerId === room.hostPlayerId ? room.botSlots : Array(room.maxPlayers).fill(false);
@@ -567,6 +935,7 @@ function startRematchIfReady(room) {
   room.rematchVotes.clear();
   room.rematchResetSeries = false;
   room.state = "playing";
+  resetRoomReplay(room);
   broadcastRoom(room, {
     cmd: "rematch_start",
     reset_series: resetSeries,
@@ -587,13 +956,15 @@ function sendRoomStatus(room, cmd = "lobby_update") {
       player: player.playerId,
       host_player: room.hostPlayerId,
       mode: room.mode,
+      visibility: room.visibility,
       connected_players: occupiedCount(room),
       required_players: room.maxPlayers,
       bot_slots: privateBotSlotsFor(room, player),
       skins: room.skins,
       state: room.state,
       token: player.reconnectToken || "",
-      owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
+      owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1,
+      owner_eligible: ownerAccountMatches(player)
     });
   }
 }
@@ -602,6 +973,7 @@ function startRoomIfReady(room) {
   clearClosedPlayers(room);
   if (occupiedCount(room) < room.maxPlayers) return;
   room.state = "playing";
+  resetRoomReplay(room);
   if (room.rematchVotes instanceof Set) room.rematchVotes.clear();
   room.rematchResetSeries = false;
 
@@ -612,13 +984,15 @@ function startRoomIfReady(room) {
       player: player.playerId,
       host_player: room.hostPlayerId,
       mode: room.mode,
+      visibility: room.visibility,
       connected_players: occupiedCount(room),
       required_players: room.maxPlayers,
       bot_slots: privateBotSlotsFor(room, player),
       skins: room.skins,
       state: room.state,
       token: player.reconnectToken || "",
-      owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
+      owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1,
+      owner_eligible: ownerAccountMatches(player)
     });
   }
 }
@@ -663,6 +1037,7 @@ function lobbySummary(room) {
   return {
     code: room.code,
     mode: room.mode,
+    visibility: room.visibility,
     state: room.state,
     connected_players: occupiedCount(room),
     required_players: room.maxPlayers,
@@ -678,6 +1053,7 @@ function openLobbies(mode = "") {
 
   return Array.from(rooms.values())
     .filter((room) => room.state === "open")
+    .filter((room) => room.visibility === "public")
     .filter((room) => !wantedMode || room.mode === wantedMode)
     .map(lobbySummary)
     .filter((room) => room.open_slots > 0 && room.expires_in_ms > 0)
@@ -695,6 +1071,9 @@ function createRoomForHost(ws, msg) {
   const tokens = Array(maxPlayers).fill("");
   const disconnectedUntil = Array(maxPlayers).fill(0);
   const botSlots = Array(maxPlayers).fill(false);
+  const slotOnlineIds = Array(maxPlayers).fill("");
+  const slotNames = Array(maxPlayers).fill("");
+  const visibility = String(msg.visibility || "private").toLowerCase() === "public" ? "public" : "private";
 
   ws.playerId = 0;
   ws.roomCode = code;
@@ -703,6 +1082,8 @@ function createRoomForHost(ws, msg) {
   players[0] = ws;
   skins[0] = ws.skin;
   tokens[0] = ws.reconnectToken;
+  slotOnlineIds[0] = sanitizeId(ws.onlineId);
+  slotNames[0] = sanitizeName(ws.playerName || ws.onlineId || "SPIELER");
 
   const room = {
     code,
@@ -713,6 +1094,11 @@ function createRoomForHost(ws, msg) {
     tokens,
     disconnectedUntil,
     botSlots,
+    slotOnlineIds,
+    slotNames,
+    participantIds: new Set(slotOnlineIds[0] ? [slotOnlineIds[0]] : []),
+    spectators: new Set(),
+    visibility,
     hostPlayerId: 0,
     rematchVotes: new Set(),
     rematchResetSeries: false,
@@ -729,13 +1115,15 @@ function createRoomForHost(ws, msg) {
     player: 0,
     host_player: 0,
     mode,
+    visibility,
     connected_players: 1,
     required_players: maxPlayers,
     bot_slots: botSlots,
     skins,
     state: room.state,
     token: ws.reconnectToken,
-    owner_player: -1
+    owner_player: -1,
+    owner_eligible: ownerAccountMatches(ws)
   });
 
   return room;
@@ -757,6 +1145,9 @@ function joinRoom(ws, room, msg, cmd = "lobby") {
   room.skins[slot] = ws.skin;
   room.tokens[slot] = ws.reconnectToken;
   room.disconnectedUntil[slot] = 0;
+  room.slotOnlineIds[slot] = sanitizeId(ws.onlineId);
+  room.slotNames[slot] = sanitizeName(ws.playerName || ws.onlineId || `P${slot + 1}`);
+  if (room.slotOnlineIds[slot]) room.participantIds.add(room.slotOnlineIds[slot]);
 
   send(ws, {
     cmd,
@@ -764,13 +1155,15 @@ function joinRoom(ws, room, msg, cmd = "lobby") {
     player: slot,
     host_player: room.hostPlayerId,
     mode: room.mode,
+    visibility: room.visibility,
     connected_players: occupiedCount(room),
     required_players: room.maxPlayers,
     bot_slots: privateBotSlotsFor(room, ws),
     skins: room.skins,
     state: room.state,
     token: ws.reconnectToken,
-    owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
+    owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1,
+    owner_eligible: ownerAccountMatches(ws)
   });
 
   sendRoomStatus(room);
@@ -779,32 +1172,103 @@ function joinRoom(ws, room, msg, cmd = "lobby") {
 }
 
 function saveMatchResult(room, msg) {
+  const replayId = `${room ? room.code : String(msg.code || "MATCH")}-${Date.now().toString(36).toUpperCase()}`;
+  const sourcePlayers = Array.isArray(msg.players) ? msg.players.slice(0, MAX_PLAYERS) : [];
+  const resultPlayers = sourcePlayers.map((player, slot) => ({
+    ...player,
+    name: sanitizeName((room && room.slotNames && room.slotNames[slot]) || player.name || `P${slot + 1}`),
+    online_id: sanitizeId((room && room.slotOnlineIds && room.slotOnlineIds[slot]) || player.online_id || ""),
+    team: Number.isFinite(Number(player.team)) ? Math.floor(Number(player.team)) : teamForSlot(room, slot)
+  }));
   const result = {
+    id: replayId,
     code: room ? room.code : String(msg.code || ""),
     mode: room ? room.mode : normalizeMode(msg.mode),
+    visibility: room ? room.visibility : "private",
     winner_team: Number.isFinite(Number(msg.winner_team)) ? Number(msg.winner_team) : -1,
     duration_seconds: Math.max(0, Math.floor(Number(msg.duration_seconds || 0))),
     team_wins: Array.isArray(msg.team_wins) ? msg.team_wins.slice(0, 3) : [],
-    players: Array.isArray(msg.players) ? msg.players.slice(0, MAX_PLAYERS) : [],
+    players: resultPlayers,
     created_at: new Date().toISOString()
   };
 
   matchHistory.unshift(result);
   while (matchHistory.length > HISTORY_LIMIT) matchHistory.pop();
 
-  replaySummaries.unshift({
-    id: `${result.code}-${Date.now().toString(36)}`,
+  const summary = {
+    id: replayId,
     code: result.code,
     mode: result.mode,
+    visibility: result.visibility,
     winner_team: result.winner_team,
     duration_seconds: result.duration_seconds,
     team_wins: result.team_wins,
     players: result.players,
+    highlight_count: room && Array.isArray(room.replayHighlights) ? room.replayHighlights.length : 0,
+    frame_count: room && Array.isArray(room.replayFrames) ? room.replayFrames.length : 0,
     created_at: result.created_at
+  };
+  replaySummaries.unshift(summary);
+  while (replaySummaries.length > REPLAY_STORE_LIMIT) replaySummaries.pop();
+
+  replayStore.set(replayId, {
+    ...summary,
+    frames: room && Array.isArray(room.replayFrames) ? room.replayFrames : [],
+    highlights: room && Array.isArray(room.replayHighlights) ? room.replayHighlights : []
   });
-  while (replaySummaries.length > HISTORY_LIMIT) replaySummaries.pop();
+
+  const participantIds = new Set(result.players.map((player) => sanitizeId(player.online_id)).filter(Boolean));
+  if (room && room.participantIds instanceof Set) {
+    for (const playerId of room.participantIds) if (playerId) participantIds.add(sanitizeId(playerId));
+  }
+  for (const playerId of participantIds) {
+    const list = replayByPlayer.get(playerId) || [];
+    list.unshift(replayId);
+    replayByPlayer.set(playerId, Array.from(new Set(list)).slice(0, PLAYER_REPLAY_LIMIT));
+  }
+
+  while (replayStore.size > REPLAY_STORE_LIMIT) {
+    const oldestId = replaySummaries[replaySummaries.length - 1] && replaySummaries[replaySummaries.length - 1].id;
+    if (!oldestId || oldestId === replayId) break;
+    replayStore.delete(oldestId);
+    replaySummaries.pop();
+  }
 
   return result;
+}
+
+function replaySummariesForPlayer(playerId) {
+  const safeId = sanitizeId(playerId);
+  if (!safeId) return [];
+  return (replayByPlayer.get(safeId) || [])
+    .map((id) => replayStore.get(id))
+    .filter(Boolean)
+    .slice(0, PLAYER_REPLAY_LIMIT)
+    .map(({ frames, highlights, ...summary }) => summary);
+}
+
+function liveMatchSummary(room) {
+  return {
+    id: room.code,
+    mode: room.mode,
+    state: room.state,
+    duration_seconds: Math.max(0, Math.floor((Date.now() - (room.matchStartedAt || room.createdAt)) / 1000)),
+    players: room.slotNames.map((name, slot) => ({
+      name: sanitizeName(name || `P${slot + 1}`),
+      team: teamForSlot(room, slot)
+    })),
+    connected_players: occupiedCount(room),
+    spectators: roomSpectators(room).length
+  };
+}
+
+function liveMatches(mode = "") {
+  const wantedMode = mode ? normalizeMode(mode) : "";
+  return Array.from(rooms.values())
+    .filter((room) => room.visibility === "public" && room.state === "playing")
+    .filter((room) => !wantedMode || room.mode === wantedMode)
+    .map(liveMatchSummary)
+    .sort((left, right) => right.connected_players - left.connected_players);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -812,6 +1276,84 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "OPTIONS") {
     sendJson(res, 204, {});
+    return;
+  }
+
+  if (url.pathname === "/auth/start") {
+    cleanAuthState();
+    const provider = String(url.searchParams.get("provider") || "google").toLowerCase();
+    const providerConfigured = provider === "google" ? googleAuthConfigured() : provider === "apple" ? appleAuthConfigured() : false;
+    if (!providerConfigured) {
+      sendJson(res, 503, {
+        ok: false,
+        message: provider === "apple" ? "Apple Login ist noch nicht konfiguriert." : "Google Login ist noch nicht konfiguriert."
+      });
+      return;
+    }
+    const state = makeToken();
+    const redirectUri = `${serverOrigin(req)}/auth/callback/${provider}`;
+    authRequests.set(state, { provider, status: "pending", createdAt: Date.now(), redirectUri });
+    const authUrl = new URL(provider === "apple" ? "https://appleid.apple.com/auth/authorize" : "https://accounts.google.com/o/oauth2/v2/auth");
+    authUrl.searchParams.set("client_id", provider === "apple" ? APPLE_CLIENT_ID : GOOGLE_CLIENT_ID);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("scope", provider === "apple" ? "name email" : "openid email profile");
+    authUrl.searchParams.set("state", state);
+    if (provider === "apple") authUrl.searchParams.set("response_mode", "form_post");
+    else authUrl.searchParams.set("prompt", "select_account");
+    sendJson(res, 200, { ok: true, provider, state, auth_url: authUrl.toString(), expires_in_seconds: 600 });
+    return;
+  }
+
+  if (url.pathname === "/auth/status") {
+    cleanAuthState();
+    const state = String(url.searchParams.get("state") || "");
+    const request = authRequests.get(state);
+    if (!request) {
+      sendJson(res, 404, { ok: false, status: "expired", message: "Login-Anfrage abgelaufen." });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: request.status === "complete",
+      status: request.status,
+      message: request.message || "",
+      session_token: request.status === "complete" ? request.sessionToken : "",
+      account: request.status === "complete" ? request.account : null
+    });
+    return;
+  }
+
+  if (url.pathname === "/auth/callback/google" || url.pathname === "/auth/callback/apple") {
+    cleanAuthState();
+    let callbackParams = url.searchParams;
+    if (req.method === "POST") callbackParams = new URLSearchParams(await readBody(req));
+    const state = String(callbackParams.get("state") || "");
+    const code = String(callbackParams.get("code") || "");
+    const request = authRequests.get(state);
+    let title = "SpaceRocks Login fehlgeschlagen";
+    let message = "Die Anmeldung konnte nicht abgeschlossen werden.";
+
+    if (request && code) {
+      try {
+        const account = request.provider === "apple"
+          ? await exchangeAppleCode(code, request.redirectUri, callbackParams.get("user") || "")
+          : await exchangeGoogleCode(code, request.redirectUri);
+        const sessionToken = makeToken() + makeToken();
+        authSessions.set(sessionToken, { ...account, createdAt: Date.now() });
+        request.status = "complete";
+        request.sessionToken = sessionToken;
+        request.account = account;
+        request.message = "Anmeldung erfolgreich.";
+        title = "SpaceRocks Login erfolgreich";
+        message = "Du kannst dieses Fenster schliessen und zu SpaceRocks zurueckkehren.";
+      } catch (error) {
+        request.status = "error";
+        request.message = error.message || "Google Login fehlgeschlagen.";
+      }
+    }
+
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(`<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;background:#06111c;color:#dff8ff;text-align:center;padding:80px"><h1>${title}</h1><p>${message}</p></body></html>`);
     return;
   }
 
@@ -828,6 +1370,13 @@ const server = http.createServer(async (req, res) => {
       private_release_proxy: USE_RELEASE_PROXY,
       github_private_access_configured: Boolean(GITHUB_TOKEN),
       owner_auth_configured: Boolean(OWNER_SECRET),
+      owner_account_configured: Boolean(OWNER_ACCOUNT || OWNER_PLAYER_ID),
+      auth_required: AUTH_REQUIRED,
+      google_auth_configured: googleAuthConfigured(),
+      apple_auth_configured: appleAuthConfigured(),
+      live_matches: liveMatches().length,
+      active_spectators: Array.from(rooms.values()).reduce((sum, room) => sum + roomSpectators(room).length, 0),
+      banned_players: publicBanList().length,
       protected_score_sessions: scoreSessions.size,
       uptime_seconds: Math.floor(process.uptime())
     });
@@ -902,6 +1451,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/lobbies") {
+    if (!requireRequestAuth(req, res)) return;
     sendJson(res, 200, {
       ok: true,
       lobbies: openLobbies(url.searchParams.get("mode") || "")
@@ -910,18 +1460,55 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/history") {
+    const auth = requireRequestAuth(req, res, url.searchParams.get("player_id"));
+    if (!auth) return;
+    const playerId = auth.playerId;
+    const history = playerId
+      ? matchHistory.filter((match) => Array.isArray(match.players) && match.players.some((player) => sanitizeId(player.online_id) === playerId)).slice(0, 10)
+      : matchHistory.slice(0, 20);
     sendJson(res, 200, {
       ok: true,
-      history: matchHistory.slice(0, 20)
+      history
     });
     return;
   }
 
   if (url.pathname === "/replays") {
+    const auth = requireRequestAuth(req, res, url.searchParams.get("player_id"));
+    if (!auth) return;
+    const playerId = auth.playerId;
     sendJson(res, 200, {
       ok: true,
-      replays: replaySummaries.slice(0, 20)
+      replays: playerId ? replaySummariesForPlayer(playerId) : replaySummaries.slice(0, 10)
     });
+    return;
+  }
+
+  if (url.pathname === "/live-matches") {
+    if (!requireRequestAuth(req, res)) return;
+    sendJson(res, 200, {
+      ok: true,
+      matches: liveMatches(url.searchParams.get("mode") || "")
+    });
+    return;
+  }
+
+  if (url.pathname.startsWith("/replay/")) {
+    const auth = requireRequestAuth(req, res, url.searchParams.get("player_id"));
+    if (!auth) return;
+    const replayId = decodeURIComponent(url.pathname.slice("/replay/".length));
+    const replay = replayStore.get(replayId);
+    if (!replay) {
+      sendJson(res, 404, { ok: false, message: "Replay nicht gefunden oder Server wurde neu gestartet." });
+      return;
+    }
+    const playerId = auth.playerId;
+    const isParticipant = !playerId || replay.players.some((player) => sanitizeId(player.online_id) === playerId);
+    if (!isParticipant) {
+      sendJson(res, 403, { ok: false, message: "Dieses Replay gehoert nicht zu deinem Account." });
+      return;
+    }
+    sendJson(res, 200, { ok: true, replay });
     return;
   }
 
@@ -934,7 +1521,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/friends" && req.method === "GET") {
-    const playerId = sanitizeId(url.searchParams.get("player_id"));
+    const auth = requireRequestAuth(req, res, url.searchParams.get("player_id"));
+    if (!auth) return;
+    const playerId = auth.playerId;
     sendJson(res, 200, {
       ok: true,
       player_id: playerId,
@@ -945,7 +1534,9 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/friends/add" && req.method === "POST") {
     const body = await readJson(req);
-    const playerId = sanitizeId(body.player_id);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
+    const playerId = auth.playerId;
     const friendId = sanitizeId(body.friend_id);
 
     if (!playerId || !friendId || playerId === friendId) {
@@ -961,7 +1552,9 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/invites" && req.method === "GET") {
     cleanupInvites();
-    const playerId = sanitizeId(url.searchParams.get("player_id"));
+    const auth = requireRequestAuth(req, res, url.searchParams.get("player_id"));
+    if (!auth) return;
+    const playerId = auth.playerId;
     sendJson(res, 200, {
       ok: true,
       invites: invites.filter((invite) => invite.to_id === playerId).slice(0, 10)
@@ -972,7 +1565,9 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/invites" && req.method === "POST") {
     cleanupInvites();
     const body = await readJson(req);
-    const fromId = sanitizeId(body.from_id);
+    const auth = requireRequestAuth(req, res, body.from_id);
+    if (!auth) return;
+    const fromId = auth.playerId;
     const toId = sanitizeId(body.to_id);
     const code = String(body.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
     const mode = normalizeMode(body.mode || "1v1");
@@ -999,7 +1594,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/cloud-save" && req.method === "GET") {
-    const playerId = sanitizeId(url.searchParams.get("player_id"));
+    const auth = requireRequestAuth(req, res, url.searchParams.get("player_id"));
+    if (!auth) return;
+    const playerId = auth.playerId;
     const save = playerId ? cloudSaves.get(playerId) : null;
     if (!save) {
       sendJson(res, 404, { ok: false, message: "Cloud save not found." });
@@ -1012,7 +1609,9 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/cloud-save" && req.method === "POST") {
     const body = await readJson(req);
-    const playerId = sanitizeId(body.player_id);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
+    const playerId = auth.playerId;
     if (!playerId || !body.data || typeof body.data !== "object") {
       sendJson(res, 400, { ok: false, message: "Cloud save needs player_id and data." });
       return;
@@ -1056,6 +1655,14 @@ wss.on("connection", (ws, req) => {
   ws.reconnectToken = "";
   ws.downloadUrl = publicDownloadUrl(req);
   ws.isOwner = false;
+  ws.onlineId = "";
+  ws.playerName = "SPIELER";
+  ws.accountId = "";
+  ws.accountEmail = "";
+  ws.authToken = "";
+  ws.isSpectator = false;
+  ws.remoteAddress = String((req.socket && req.socket.remoteAddress) || req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  ws.ipHash = connectionIpHash(ws);
 
   ws.on("message", (raw) => {
     const msg = safeJson(String(raw).replace(/\0/g, "").trim());
@@ -1066,7 +1673,7 @@ wss.on("connection", (ws, req) => {
 
     if (msg.cmd === "owner_auth") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
-      const authorized = ownerSecretMatches(msg.secret);
+      const authorized = ownerSecretMatches(msg.secret) && ownerAccountMatches(ws);
       ws.isOwner = authorized;
 
       if (authorized && room && ws.playerId >= 0) {
@@ -1078,7 +1685,7 @@ wss.on("connection", (ws, req) => {
         cmd: "owner_status",
         authorized,
         player: authorized ? ws.playerId : -1,
-        message: authorized ? "Owner access granted." : "Owner access denied."
+        message: authorized ? "Owner access granted." : "Owner access denied: falscher Account oder Key."
       });
       return;
     }
@@ -1115,6 +1722,59 @@ wss.on("connection", (ws, req) => {
         return;
       }
 
+      if (command === "players") {
+        const lines = room.players.map((player, slot) => {
+          if (!player || player.readyState !== WebSocket.OPEN) return `P${slot + 1}: LEER`;
+          return `P${slot + 1}: ${sanitizeName(player.playerName)} ${sanitizeId(player.onlineId)}`;
+        });
+        send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: lines.join(" | ").slice(0, 900) });
+        return;
+      }
+
+      if (command === "ban") {
+        const targetSlot = Math.max(0, Math.min(room.maxPlayers - 1, (Number(parts.shift()) || 1) - 1));
+        const target = room.players[targetSlot];
+        if (!target || target === ws || target.readyState !== WebSocket.OPEN) {
+          send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Ban fehlgeschlagen. Nutze /players und dann /ban SLOT GRUND." });
+          return;
+        }
+        const record = addPlayerBan(target, parts.join(" "), ws.accountId || ws.onlineId);
+        send(target, { cmd: "banned", message: record.reason ? `Gebannt: ${record.reason}` : "Vom Owner gebannt." });
+        send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: `${record.player_name} (${record.player_id}) wurde gebannt.` });
+        setTimeout(() => {
+          try { target.close(4003, "Banned by owner"); } catch {}
+        }, 40);
+        return;
+      }
+
+      if (command === "unban") {
+        const playerId = sanitizeId(parts[0]);
+        const removed = removePlayerBan(playerId);
+        send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: removed ? `${playerId} wurde entbannt.` : "Ban-ID nicht gefunden." });
+        return;
+      }
+
+      if (command === "banlist") {
+        const list = publicBanList();
+        const text = list.length > 0 ? list.map((record) => `${record.player_name}:${record.player_id}`).join(" | ") : "Banliste ist leer.";
+        send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: text.slice(0, 900) });
+        return;
+      }
+
+      if (command === "unlockall") {
+        const targetSlot = parts.length > 0
+          ? Math.max(0, Math.min(room.maxPlayers - 1, (Number(parts[0]) || 1) - 1))
+          : ws.playerId;
+        const target = room.players[targetSlot];
+        if (!target || target.readyState !== WebSocket.OPEN) {
+          send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Spieler fuer /unlockall SLOT nicht gefunden." });
+          return;
+        }
+        send(target, { cmd: "owner_command", command: "unlockall", message: "Der Owner hat alle Skins freigeschaltet." });
+        send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: `Alle Skins fuer P${targetSlot + 1} freigeschaltet.` });
+        return;
+      }
+
       if (command === "announce") {
         const announcement = parts.join(" ").replace(/[^\w \-!?.,:]/g, "").slice(0, 80);
         if (announcement) broadcastRoom(room, { cmd: "owner_command", command: "announce", message: announcement });
@@ -1125,26 +1785,19 @@ wss.on("connection", (ws, req) => {
         cmd: "owner_status",
         authorized: true,
         player: ws.playerId,
-        message: "Commands: /heal, /teamwin 1, /kick 2, /announce text"
+        message: "Commands: /players, /ban SLOT GRUND, /unban ID, /banlist, /unlockall SLOT, /heal, /teamwin, /kick, /announce"
       });
       return;
     }
 
     if (msg.cmd === "host") {
-      if (!clientVersionOk(msg.version)) {
-        rejectOldClient(ws);
-        return;
-      }
-
-      createRoomForHost(ws, msg);
+      if (!allowOnlineEntry(ws, msg)) return;
+      createRoomForHost(ws, { ...msg, visibility: "private" });
       return;
     }
 
     if (msg.cmd === "quickjoin") {
-      if (!clientVersionOk(msg.version)) {
-        rejectOldClient(ws);
-        return;
-      }
+      if (!allowOnlineEntry(ws, msg)) return;
 
       const mode = normalizeMode(msg.mode);
       const lobby = openLobbies(mode)[0];
@@ -1157,7 +1810,7 @@ wss.on("connection", (ws, req) => {
         }
       }
 
-      const room = createRoomForHost(ws, { ...msg, mode });
+      const room = createRoomForHost(ws, { ...msg, mode, visibility: "public" });
       setTimeout(() => {
         if (rooms.get(room.code) === room && room.state === "open") fillRoomWithBots(room);
       }, QUICK_MATCH_WAIT_MS);
@@ -1165,10 +1818,7 @@ wss.on("connection", (ws, req) => {
     }
 
     if (msg.cmd === "join") {
-      if (!clientVersionOk(msg.version)) {
-        rejectOldClient(ws);
-        return;
-      }
+      if (!allowOnlineEntry(ws, msg)) return;
 
       cleanupExpiredRooms();
 
@@ -1196,10 +1846,7 @@ wss.on("connection", (ws, req) => {
     }
 
     if (msg.cmd === "reconnect") {
-      if (!clientVersionOk(msg.version)) {
-        rejectOldClient(ws);
-        return;
-      }
+      if (!allowOnlineEntry(ws, msg)) return;
 
       cleanupExpiredRooms();
 
@@ -1231,6 +1878,9 @@ wss.on("connection", (ws, req) => {
       if (room.botSlots) room.botSlots[slot] = false;
       room.skins[slot] = ws.skin;
       room.disconnectedUntil[slot] = 0;
+      room.slotOnlineIds[slot] = sanitizeId(ws.onlineId);
+      room.slotNames[slot] = sanitizeName(ws.playerName || ws.onlineId || `P${slot + 1}`);
+      if (room.slotOnlineIds[slot]) room.participantIds.add(room.slotOnlineIds[slot]);
       if (room.hostPlayerId < 0) ensureRoomHost(room);
 
       send(ws, {
@@ -1239,13 +1889,15 @@ wss.on("connection", (ws, req) => {
         player: slot,
         host_player: room.hostPlayerId,
         mode: room.mode,
+        visibility: room.visibility,
         connected_players: occupiedCount(room),
         required_players: room.maxPlayers,
         bot_slots: privateBotSlotsFor(room, ws),
         skins: room.skins,
         state: room.state,
         token,
-        owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
+        owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1,
+        owner_eligible: ownerAccountMatches(ws)
       });
 
       sendRoomStatus(room, "lobby_update");
@@ -1256,15 +1908,48 @@ wss.on("connection", (ws, req) => {
           player: slot,
           host_player: room.hostPlayerId,
           mode: room.mode,
+          visibility: room.visibility,
           connected_players: occupiedCount(room),
           required_players: room.maxPlayers,
           bot_slots: privateBotSlotsFor(room, ws),
           skins: room.skins,
           state: room.state,
           token,
-          owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
+          owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1,
+          owner_eligible: ownerAccountMatches(ws)
         });
       }
+      return;
+    }
+
+    if (msg.cmd === "spectate") {
+      if (!allowOnlineEntry(ws, msg)) return;
+      cleanupExpiredRooms();
+      const matchId = String(msg.match_id || msg.code || "").toUpperCase();
+      const room = rooms.get(matchId);
+      if (!room || room.visibility !== "public" || room.state !== "playing") {
+        send(ws, { cmd: "error", message: "Dieses Live-Match ist nicht mehr verfuegbar." });
+        return;
+      }
+      if (roomSpectators(room).length >= MAX_SPECTATORS_PER_MATCH) {
+        send(ws, { cmd: "error", message: "Zuschauerplaetze sind voll." });
+        return;
+      }
+      ws.roomCode = room.code;
+      ws.playerId = -1;
+      ws.isSpectator = true;
+      room.spectators.add(ws);
+      send(ws, {
+        cmd: "spectator_start",
+        code: room.code,
+        mode: room.mode,
+        required_players: room.maxPlayers,
+        skins: room.skins,
+        player_names: room.slotNames,
+        snapshot: room.latestSnapshot,
+        spectators: roomSpectators(room).length
+      });
+      broadcastSpectators(room, { cmd: "spectator_count", spectators: roomSpectators(room).length });
       return;
     }
 
@@ -1295,7 +1980,10 @@ wss.on("connection", (ws, req) => {
     if (msg.cmd === "snapshot") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
       if (!room || ws.playerId !== room.hostPlayerId) return;
-      broadcastRoom(room, { cmd: "snapshot", snapshot: msg.snapshot || {} }, ws);
+      const snapshot = msg.snapshot || {};
+      recordRoomSnapshot(room, snapshot);
+      broadcastRoom(room, { cmd: "snapshot", snapshot }, ws);
+      broadcastSpectators(room, { cmd: "snapshot", snapshot });
       return;
     }
 
@@ -1305,6 +1993,7 @@ wss.on("connection", (ws, req) => {
       const result = saveMatchResult(room, msg);
       room.state = "finished";
       broadcastRoom(room, { cmd: "match_result", result }, null);
+      broadcastSpectators(room, { cmd: "match_result", result }, null);
       return;
     }
 
@@ -1321,6 +2010,11 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
     if (!room) return;
+    if (ws.isSpectator) {
+      if (room.spectators instanceof Set) room.spectators.delete(ws);
+      broadcastSpectators(room, { cmd: "spectator_count", spectators: roomSpectators(room).length });
+      return;
+    }
     if (ws.playerId >= 0 && ws.playerId < room.players.length) {
       room.players[ws.playerId] = null;
       room.disconnectedUntil[ws.playerId] = Date.now() + RECONNECT_TTL_MS;

@@ -38,6 +38,9 @@ Free Services koennen einschlafen. Beim ersten Join/Host kann es ein paar Sekund
 - Einstimmige Revanche-Abstimmung; Bots stimmen automatisch zu
 - Host-Wechsel und laufende Runden bei Spieler-Disconnects
 - Servergepruefter Owner-Rang mit privaten Admin-Befehlen
+- Google- und Apple-Anmeldung fuer den Onlinebereich
+- Private Code-Lobbys, die niemals in Quick Match auftauchen
+- Live-Zuschauen und die letzten zehn Match-Replays
 - Match-History ueber `/history`
 - Replay-Summaries ueber `/replays`
 - Server-News ueber `/news`
@@ -57,12 +60,35 @@ SPACEROCKS_DOWNLOAD_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/l
 SPACEROCKS_GITHUB_TOKEN=DEIN_PRIVATE_REPO_READ_TOKEN
 SPACEROCKS_USE_RELEASE_PROXY=true
 SPACEROCKS_OWNER_SECRET=LANGER_ZUFAELLIGER_OWNER_KEY
+SPACEROCKS_OWNER_ACCOUNT=deine-google-oder-apple-account-id
+SPACEROCKS_AUTH_REQUIRED=true
+SPACEROCKS_PUBLIC_BASE_URL=https://spacerocks-windows-relay.onrender.com
+SPACEROCKS_GOOGLE_CLIENT_ID=GOOGLE_WEB_CLIENT_ID
+SPACEROCKS_GOOGLE_CLIENT_SECRET=GOOGLE_WEB_CLIENT_SECRET
+SPACEROCKS_APPLE_CLIENT_ID=APPLE_SERVICES_ID
+SPACEROCKS_APPLE_TEAM_ID=APPLE_TEAM_ID
+SPACEROCKS_APPLE_KEY_ID=APPLE_SIGN_IN_KEY_ID
+SPACEROCKS_APPLE_PRIVATE_KEY=APPLE_P8_PRIVATE_KEY
 ```
 
 Wenn `MIN_CLIENT_VERSION` hoeher ist als die Spielversion, blockt der Server den alten Client.
 Wenn das GitHub-Repo privat ist, braucht Render `SPACEROCKS_GITHUB_TOKEN`, damit `/launcher-release` und `/download/...` die privaten Release-ZIPs lesen koennen.
 
-`SPACEROCKS_OWNER_SECRET` bleibt ausschliesslich als geheime Render-Variable. Der Client speichert den Key weder in Saves noch in INI-Dateien oder Optionen. Im Match oeffnet F12 den Owner-Login. Nach erfolgreicher Serverpruefung stehen `/heal`, `/teamwin 1`, `/kick 2` und `/announce TEXT` zur Verfuegung.
+`SPACEROCKS_AUTH_REQUIRED` erst auf `true` setzen, nachdem mindestens Google oder Apple komplett konfiguriert wurde. Sonst kann sich niemand anmelden.
+
+Google Redirect URI:
+
+```text
+https://spacerocks-windows-relay.onrender.com/auth/callback/google
+```
+
+Apple Return URL:
+
+```text
+https://spacerocks-windows-relay.onrender.com/auth/callback/apple
+```
+
+`SPACEROCKS_OWNER_SECRET` und alle OAuth-Secrets bleiben ausschliesslich als geheime Render-Variablen. Der Client speichert weder Secrets noch Login-Tokens in Saves, INI-Dateien oder Optionen. `SPACEROCKS_OWNER_ACCOUNT` bindet den Owner-Rang zusaetzlich an genau ein Google-/Apple-Konto. Im Match oeffnet F12 den Owner-Login. Nach erfolgreicher Serverpruefung stehen unter anderem `/players`, `/ban SLOT GRUND`, `/unban ID`, `/banlist`, `/unlockall SLOT`, `/heal`, `/teamwin 1`, `/kick 2` und `/announce TEXT` zur Verfuegung.
 
 ## Immer online
 
