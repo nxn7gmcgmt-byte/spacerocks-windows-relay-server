@@ -11,7 +11,7 @@ const QUICK_MATCH_WAIT_MS = 2500;
 const HISTORY_LIMIT = 50;
 const MAX_TEAM_SIZE = 100;
 const MAX_PLAYERS = 200;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.6";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.7";
 const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.6";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
@@ -31,8 +31,8 @@ const invites = [];
 const replaySummaries = [];
 const serverNews = [
   {
-    title: "SpaceRocks Online v1.0.6",
-    text: "Private GitHub-Downloads laufen jetzt ueber den Render-Server.",
+    title: "SpaceRocks Online v1.0.7",
+    text: "Revanche-Abstimmung, sichere Disconnects und Owner-Rang sind online.",
     created_at: new Date().toISOString()
   },
   {
