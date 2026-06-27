@@ -1,4 +1,5 @@
 const http = require("http");
+const crypto = require("crypto");
 const { Readable } = require("stream");
 const WebSocket = require("ws");
 
@@ -6,6 +7,7 @@ const PORT = Number(process.env.PORT || 10000);
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CODE_TTL_MS = 1000 * 60 * 60;
 const RECONNECT_TTL_MS = 1000 * 60 * 3;
+const QUICK_MATCH_WAIT_MS = 2500;
 const HISTORY_LIMIT = 50;
 const MAX_TEAM_SIZE = 100;
 const MAX_PLAYERS = 200;
@@ -19,6 +21,7 @@ const GITHUB_TOKEN = process.env.SPACEROCKS_GITHUB_TOKEN || process.env.GITHUB_T
 const RELEASE_TAG = process.env.SPACEROCKS_RELEASE_TAG || `v${LATEST_VERSION}`;
 const DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_DOWNLOAD_ASSET_NAME || `SpaceRocks-v${LATEST_VERSION}-windows.zip`;
 const USE_RELEASE_PROXY = process.env.SPACEROCKS_USE_RELEASE_PROXY !== "false";
+const OWNER_SECRET = process.env.SPACEROCKS_OWNER_SECRET || "";
 
 const rooms = new Map();
 const matchHistory = [];
@@ -226,6 +229,13 @@ function sanitizeName(name) {
   return String(name || "SPIELER").replace(/[^\w \-]/g, "").slice(0, 18) || "SPIELER";
 }
 
+function ownerSecretMatches(value) {
+  if (!OWNER_SECRET) return false;
+  const provided = Buffer.from(String(value || ""));
+  const expected = Buffer.from(OWNER_SECRET);
+  return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
+}
+
 function getFriendArray(playerId) {
   if (!friendLists.has(playerId)) friendLists.set(playerId, []);
   return friendLists.get(playerId);
@@ -358,6 +368,31 @@ function botCount(room) {
   return room.botSlots.filter(Boolean).length;
 }
 
+function teamCountForMode(mode) {
+  return normalizeMode(mode).split("v").length;
+}
+
+function teamForSlot(room, slot) {
+  return Math.max(0, Number(slot) || 0) % teamCountForMode(room ? room.mode : "1v1");
+}
+
+function activeTeams(room) {
+  const teams = new Set();
+  if (!room) return teams;
+
+  for (const player of roomPlayers(room)) {
+    teams.add(teamForSlot(room, player.playerId));
+  }
+
+  if (Array.isArray(room.botSlots)) {
+    for (let slot = 0; slot < room.botSlots.length; slot += 1) {
+      if (room.botSlots[slot]) teams.add(teamForSlot(room, slot));
+    }
+  }
+
+  return teams;
+}
+
 function occupiedCount(room) {
   return connectedCount(room) + botCount(room);
 }
@@ -380,7 +415,69 @@ function broadcastRoom(room, data, except = null) {
 
 function privateBotSlotsFor(room, player) {
   if (!room || !Array.isArray(room.botSlots)) return Array(room ? room.maxPlayers : 0).fill(false);
-  return player && player.playerId === 0 ? room.botSlots : Array(room.maxPlayers).fill(false);
+  return player && player.playerId === room.hostPlayerId ? room.botSlots : Array(room.maxPlayers).fill(false);
+}
+
+function ensureRoomHost(room) {
+  if (!room) return -1;
+  const current = room.players[room.hostPlayerId];
+  if (current && current.readyState === WebSocket.OPEN) return room.hostPlayerId;
+
+  const nextHost = roomPlayers(room).sort((a, b) => a.playerId - b.playerId)[0] || null;
+  room.hostPlayerId = nextHost ? nextHost.playerId : -1;
+
+  for (const player of roomPlayers(room)) {
+    send(player, {
+      cmd: "host_migrated",
+      host_player: room.hostPlayerId,
+      bot_slots: privateBotSlotsFor(room, player),
+      message: room.hostPlayerId >= 0 ? "Host migrated." : "No host available."
+    });
+  }
+
+  return room.hostPlayerId;
+}
+
+function rematchStatus(room) {
+  if (!room) return { ready: 0, required: 0 };
+  if (!(room.rematchVotes instanceof Set)) room.rematchVotes = new Set();
+
+  const connectedIds = new Set(roomPlayers(room).map((player) => player.playerId));
+  for (const playerId of room.rematchVotes) {
+    if (!connectedIds.has(playerId)) room.rematchVotes.delete(playerId);
+  }
+
+  return {
+    ready: room.rematchVotes.size + botCount(room),
+    required: connectedIds.size + botCount(room)
+  };
+}
+
+function broadcastRematchStatus(room) {
+  const status = rematchStatus(room);
+  broadcastRoom(room, {
+    cmd: "rematch_update",
+    ready: status.ready,
+    required: status.required
+  });
+  return status;
+}
+
+function startRematchIfReady(room) {
+  const status = broadcastRematchStatus(room);
+  if (status.required <= 0 || status.ready < status.required) return false;
+
+  const resetSeries = Boolean(room.rematchResetSeries);
+  room.rematchVotes.clear();
+  room.rematchResetSeries = false;
+  room.state = "playing";
+  broadcastRoom(room, {
+    cmd: "rematch_start",
+    reset_series: resetSeries,
+    ready: status.ready,
+    required: status.required
+  });
+  return true;
 }
 
 function sendRoomStatus(room, cmd = "lobby_update") {
@@ -392,13 +489,15 @@ function sendRoomStatus(room, cmd = "lobby_update") {
       cmd,
       code: room.code,
       player: player.playerId,
+      host_player: room.hostPlayerId,
       mode: room.mode,
       connected_players: occupiedCount(room),
       required_players: room.maxPlayers,
       bot_slots: privateBotSlotsFor(room, player),
       skins: room.skins,
       state: room.state,
-      token: player.reconnectToken || ""
+      token: player.reconnectToken || "",
+      owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
     });
   }
 }
@@ -407,19 +506,23 @@ function startRoomIfReady(room) {
   clearClosedPlayers(room);
   if (occupiedCount(room) < room.maxPlayers) return;
   room.state = "playing";
+  if (room.rematchVotes instanceof Set) room.rematchVotes.clear();
+  room.rematchResetSeries = false;
 
   for (const player of roomPlayers(room)) {
     send(player, {
       cmd: "start",
       code: room.code,
       player: player.playerId,
+      host_player: room.hostPlayerId,
       mode: room.mode,
       connected_players: occupiedCount(room),
       required_players: room.maxPlayers,
       bot_slots: privateBotSlotsFor(room, player),
       skins: room.skins,
       state: room.state,
-      token: player.reconnectToken || ""
+      token: player.reconnectToken || "",
+      owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
     });
   }
 }
@@ -514,6 +617,10 @@ function createRoomForHost(ws, msg) {
     tokens,
     disconnectedUntil,
     botSlots,
+    hostPlayerId: 0,
+    rematchVotes: new Set(),
+    rematchResetSeries: false,
+    ownerPlayerId: -1,
     state: "open",
     createdAt: Date.now(),
     expiresAt: Date.now() + CODE_TTL_MS
@@ -524,13 +631,15 @@ function createRoomForHost(ws, msg) {
     cmd: "hosted",
     code,
     player: 0,
+    host_player: 0,
     mode,
     connected_players: 1,
     required_players: maxPlayers,
     bot_slots: botSlots,
     skins,
     state: room.state,
-    token: ws.reconnectToken
+    token: ws.reconnectToken,
+    owner_player: -1
   });
 
   return room;
@@ -557,13 +666,15 @@ function joinRoom(ws, room, msg, cmd = "lobby") {
     cmd,
     code: room.code,
     player: slot,
+    host_player: room.hostPlayerId,
     mode: room.mode,
     connected_players: occupiedCount(room),
     required_players: room.maxPlayers,
     bot_slots: privateBotSlotsFor(room, ws),
     skins: room.skins,
     state: room.state,
-    token: ws.reconnectToken
+    token: ws.reconnectToken,
+    owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
   });
 
   sendRoomStatus(room);
@@ -620,6 +731,7 @@ const server = http.createServer(async (req, res) => {
       download_url: publicDownloadUrl(req),
       private_release_proxy: USE_RELEASE_PROXY,
       github_private_access_configured: Boolean(GITHUB_TOKEN),
+      owner_auth_configured: Boolean(OWNER_SECRET),
       uptime_seconds: Math.floor(process.uptime())
     });
     return;
@@ -792,11 +904,78 @@ wss.on("connection", (ws, req) => {
   ws.skin = 0;
   ws.reconnectToken = "";
   ws.downloadUrl = publicDownloadUrl(req);
+  ws.isOwner = false;
 
   ws.on("message", (raw) => {
     const msg = safeJson(String(raw).replace(/\0/g, "").trim());
     if (!msg || typeof msg.cmd !== "string") {
       send(ws, { cmd: "error", message: "Bad packet." });
+      return;
+    }
+
+    if (msg.cmd === "owner_auth") {
+      const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
+      const authorized = ownerSecretMatches(msg.secret);
+      ws.isOwner = authorized;
+
+      if (authorized && room && ws.playerId >= 0) {
+        room.ownerPlayerId = ws.playerId;
+        broadcastRoom(room, { cmd: "owner_badge", player: ws.playerId });
+      }
+
+      send(ws, {
+        cmd: "owner_status",
+        authorized,
+        player: authorized ? ws.playerId : -1,
+        message: authorized ? "Owner access granted." : "Owner access denied."
+      });
+      return;
+    }
+
+    if (msg.cmd === "owner_command") {
+      const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
+      if (!room || !ws.isOwner || room.ownerPlayerId !== ws.playerId) {
+        send(ws, { cmd: "owner_status", authorized: false, player: -1, message: "Owner command denied." });
+        return;
+      }
+
+      const commandText = String(msg.text || "").trim().slice(0, 120);
+      const parts = commandText.split(/\s+/);
+      const command = String(parts.shift() || "").replace(/^\//, "").toLowerCase();
+
+      if (command === "heal") {
+        broadcastRoom(room, { cmd: "owner_command", command: "heal", player: ws.playerId });
+        return;
+      }
+
+      if (command === "teamwin") {
+        const winnerTeam = Math.max(0, Math.min(teamCountForMode(room.mode) - 1, (Number(parts[0]) || 1) - 1));
+        broadcastRoom(room, { cmd: "owner_command", command: "teamwin", team: winnerTeam });
+        return;
+      }
+
+      if (command === "kick") {
+        const targetSlot = Math.max(0, Math.min(room.maxPlayers - 1, (Number(parts[0]) || 1) - 1));
+        const target = room.players[targetSlot];
+        if (target && target !== ws && target.readyState === WebSocket.OPEN) {
+          send(target, { cmd: "owner_command", command: "kicked", message: "Removed by owner." });
+          target.close(4001, "Removed by owner");
+        }
+        return;
+      }
+
+      if (command === "announce") {
+        const announcement = parts.join(" ").replace(/[^\w \-!?.,:]/g, "").slice(0, 80);
+        if (announcement) broadcastRoom(room, { cmd: "owner_command", command: "announce", message: announcement });
+        return;
+      }
+
+      send(ws, {
+        cmd: "owner_status",
+        authorized: true,
+        player: ws.playerId,
+        message: "Commands: /heal, /teamwin 1, /kick 2, /announce text"
+      });
       return;
     }
 
@@ -828,7 +1007,9 @@ wss.on("connection", (ws, req) => {
       }
 
       const room = createRoomForHost(ws, { ...msg, mode });
-      fillRoomWithBots(room);
+      setTimeout(() => {
+        if (rooms.get(room.code) === room && room.state === "open") fillRoomWithBots(room);
+      }, QUICK_MATCH_WAIT_MS);
       return;
     }
 
@@ -845,6 +1026,11 @@ wss.on("connection", (ws, req) => {
       if (!room || room.expiresAt <= Date.now()) {
         send(ws, { cmd: room ? "expired" : "not_found", message: room ? "Code expired." : "Code not found." });
         if (room) rooms.delete(code);
+        return;
+      }
+
+      if (room.state !== "open") {
+        send(ws, { cmd: "error", message: "Match already started." });
         return;
       }
 
@@ -894,18 +1080,21 @@ wss.on("connection", (ws, req) => {
       if (room.botSlots) room.botSlots[slot] = false;
       room.skins[slot] = ws.skin;
       room.disconnectedUntil[slot] = 0;
+      if (room.hostPlayerId < 0) ensureRoomHost(room);
 
       send(ws, {
         cmd: "reconnected",
         code: room.code,
         player: slot,
+        host_player: room.hostPlayerId,
         mode: room.mode,
         connected_players: occupiedCount(room),
         required_players: room.maxPlayers,
         bot_slots: privateBotSlotsFor(room, ws),
         skins: room.skins,
         state: room.state,
-        token
+        token,
+        owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
       });
 
       sendRoomStatus(room, "lobby_update");
@@ -914,13 +1103,15 @@ wss.on("connection", (ws, req) => {
           cmd: "start",
           code: room.code,
           player: slot,
+          host_player: room.hostPlayerId,
           mode: room.mode,
           connected_players: occupiedCount(room),
           required_players: room.maxPlayers,
           bot_slots: privateBotSlotsFor(room, ws),
           skins: room.skins,
           state: room.state,
-          token
+          token,
+          owner_player: Number.isInteger(room.ownerPlayerId) ? room.ownerPlayerId : -1
         });
       }
       return;
@@ -936,7 +1127,7 @@ wss.on("connection", (ws, req) => {
 
     if (msg.cmd === "bot_input") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
-      if (!room || ws.playerId !== 0) return;
+      if (!room || ws.playerId !== room.hostPlayerId) return;
       const botPlayer = Math.max(0, Math.min(room.maxPlayers - 1, Math.floor(Number(msg.player || 0))));
       if (!room.botSlots || !room.botSlots[botPlayer]) return;
       broadcastRoom(room, { cmd: "input", player: botPlayer, input: msg.input || {}, frame: msg.frame || 0 }, ws);
@@ -952,17 +1143,27 @@ wss.on("connection", (ws, req) => {
 
     if (msg.cmd === "snapshot") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
-      if (!room || ws.playerId !== 0) return;
+      if (!room || ws.playerId !== room.hostPlayerId) return;
       broadcastRoom(room, { cmd: "snapshot", snapshot: msg.snapshot || {} }, ws);
       return;
     }
 
     if (msg.cmd === "match_result") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
-      if (!room || ws.playerId !== 0) return;
+      if (!room || ws.playerId !== room.hostPlayerId) return;
       const result = saveMatchResult(room, msg);
       room.state = "finished";
       broadcastRoom(room, { cmd: "match_result", result }, null);
+      return;
+    }
+
+    if (msg.cmd === "rematch_vote") {
+      const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
+      if (!room || ws.playerId < 0) return;
+      if (!(room.rematchVotes instanceof Set)) room.rematchVotes = new Set();
+      room.rematchVotes.add(ws.playerId);
+      room.rematchResetSeries = room.rematchResetSeries || Boolean(msg.reset_series);
+      startRematchIfReady(room);
     }
   });
 
@@ -972,13 +1173,48 @@ wss.on("connection", (ws, req) => {
     if (ws.playerId >= 0 && ws.playerId < room.players.length) {
       room.players[ws.playerId] = null;
       room.disconnectedUntil[ws.playerId] = Date.now() + RECONNECT_TTL_MS;
+      if (room.rematchVotes instanceof Set) room.rematchVotes.delete(ws.playerId);
     }
+
+    const oldHost = room.hostPlayerId;
+    if (ws.isOwner && room.ownerPlayerId === ws.playerId) {
+      room.ownerPlayerId = -1;
+      broadcastRoom(room, { cmd: "owner_badge", player: -1 }, ws);
+    }
+    const newHost = ensureRoomHost(room);
     broadcastRoom(room, {
-      cmd: "peer_left",
+      cmd: "player_disconnected",
       player: ws.playerId,
+      host_player: newHost,
       reconnect_seconds: Math.floor(RECONNECT_TTL_MS / 1000),
-      message: "Player disconnected. Reconnect is possible for a short time."
+      message: "Player disconnected. Match continues."
     }, ws);
+
+
+    if (room.state === "open") {
+      sendRoomStatus(room);
+      return;
+    }
+
+    if (room.state === "playing") {
+      const teams = activeTeams(room);
+      if (teams.size === 1) {
+        const winnerTeam = Array.from(teams)[0];
+        room.state = "round_over";
+        broadcastRoom(room, {
+          cmd: "round_forfeit",
+          winner_team: winnerTeam,
+          disconnected_player: ws.playerId,
+          message: `Team ${winnerTeam + 1} wins by disconnect.`
+        });
+      } else if (teams.size === 0 && oldHost >= 0) {
+        room.state = "finished";
+      }
+    }
+
+    if (room.state === "finished" || room.state === "round_over") {
+      startRematchIfReady(room);
+    }
   });
 });
 

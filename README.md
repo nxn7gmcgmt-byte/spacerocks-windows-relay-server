@@ -35,6 +35,9 @@ Free Services koennen einschlafen. Beim ersten Join/Host kann es ein paar Sekund
 - Server-Wakeup/Status ueber `/health`
 - Update-Check ueber `/latest-version`
 - Reconnect ueber gespeicherten Match-Token
+- Einstimmige Revanche-Abstimmung; Bots stimmen automatisch zu
+- Host-Wechsel und laufende Runden bei Spieler-Disconnects
+- Servergepruefter Owner-Rang mit privaten Admin-Befehlen
 - Match-History ueber `/history`
 - Replay-Summaries ueber `/replays`
 - Server-News ueber `/news`
@@ -53,10 +56,13 @@ SPACEROCKS_RELEASE_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/la
 SPACEROCKS_DOWNLOAD_URL=https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest
 SPACEROCKS_GITHUB_TOKEN=DEIN_PRIVATE_REPO_READ_TOKEN
 SPACEROCKS_USE_RELEASE_PROXY=true
+SPACEROCKS_OWNER_SECRET=LANGER_ZUFAELLIGER_OWNER_KEY
 ```
 
 Wenn `MIN_CLIENT_VERSION` hoeher ist als die Spielversion, blockt der Server den alten Client.
 Wenn das GitHub-Repo privat ist, braucht Render `SPACEROCKS_GITHUB_TOKEN`, damit `/launcher-release` und `/download/...` die privaten Release-ZIPs lesen koennen.
+
+`SPACEROCKS_OWNER_SECRET` bleibt ausschliesslich als geheime Render-Variable. Der Client speichert den Key weder in Saves noch in INI-Dateien oder Optionen. Im Match oeffnet F12 den Owner-Login. Nach erfolgreicher Serverpruefung stehen `/heal`, `/teamwin 1`, `/kick 2` und `/announce TEXT` zur Verfuegung.
 
 ## Immer online
 
