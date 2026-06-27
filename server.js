@@ -11,7 +11,7 @@ const QUICK_MATCH_WAIT_MS = 2500;
 const HISTORY_LIMIT = 50;
 const MAX_TEAM_SIZE = 100;
 const MAX_PLAYERS = 200;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.7";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.8";
 const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.6";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
@@ -22,8 +22,11 @@ const RELEASE_TAG = process.env.SPACEROCKS_RELEASE_TAG || `v${LATEST_VERSION}`;
 const DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_DOWNLOAD_ASSET_NAME || `SpaceRocks-v${LATEST_VERSION}-windows.zip`;
 const USE_RELEASE_PROXY = process.env.SPACEROCKS_USE_RELEASE_PROXY !== "false";
 const OWNER_SECRET = process.env.SPACEROCKS_OWNER_SECRET || "";
+const SCORE_SESSION_TTL_MS = 1000 * 60 * 60 * 6;
+const SCORE_MAX_SUBMISSIONS = 260;
 
 const rooms = new Map();
+const scoreSessions = new Map();
 const matchHistory = [];
 const cloudSaves = new Map();
 const friendLists = new Map();
@@ -31,7 +34,12 @@ const invites = [];
 const replaySummaries = [];
 const serverNews = [
   {
-    title: "SpaceRocks Online v1.0.7",
+    title: "Geschuetzte Online-Bestenlisten",
+    text: "Online-Rekorde werden nur noch aus einer frischen, servergeprueften Spielrunde angenommen.",
+    created_at: new Date().toISOString()
+  },
+  {
+    title: "SpaceRocks Online v1.0.8",
     text: "Revanche-Abstimmung, sichere Disconnects und Owner-Rang sind online.",
     created_at: new Date().toISOString()
   },
@@ -41,6 +49,94 @@ const serverNews = [
     created_at: new Date().toISOString()
   }
 ];
+
+function scoreLeaderboardId(kind, wave) {
+  if (kind === "score") return 34945;
+  if (kind === "waves") return 34947;
+  if (kind === "combo") return 34948;
+  if (kind !== "wave_times") return 0;
+
+  const safeWave = Math.floor(Number(wave || 0));
+  if (safeWave < 1 || safeWave > 200) return 0;
+  if (safeWave === 1) return 34957;
+  if (safeWave >= 2 && safeWave <= 10) return 34956 + safeWave;
+  if (safeWave >= 11 && safeWave <= 21) return 34957 + safeWave;
+  if (safeWave >= 22 && safeWave <= 40) return 34958 + safeWave;
+  if (safeWave <= 122) return 35108 + (safeWave - 41);
+  return 35191 + (safeWave - 123);
+}
+
+function cleanScoreSessions() {
+  const now = Date.now();
+  for (const [token, session] of scoreSessions.entries()) {
+    if (!session || now - session.createdAt > SCORE_SESSION_TTL_MS) scoreSessions.delete(token);
+  }
+}
+
+function scoreSubmissionError(session, body) {
+  const kind = String(body.kind || "").toLowerCase();
+  const score = Math.floor(Number(body.score));
+  const wave = Math.floor(Number(body.wave || 0));
+  const runScore = Math.floor(Number(body.run_score || 0));
+  const runWave = Math.floor(Number(body.run_wave || 0));
+  const runCombo = Math.floor(Number(body.run_combo || 0));
+  const waveTime = Math.floor(Number(body.run_wave_time || 0));
+  const elapsedMs = Math.max(0, Date.now() - session.createdAt);
+  const elapsedSeconds = elapsedMs / 1000;
+
+  if (!Number.isSafeInteger(score) || score <= 0) return "Invalid score.";
+  if (session.submissions >= SCORE_MAX_SUBMISSIONS) return "Too many submissions for this run.";
+  if (runScore < 0 || runWave < 0 || runCombo < 0) return "Invalid run summary.";
+  if (runWave > 200) return "Wave is outside the supported range.";
+  if (runScore > 50000 + elapsedSeconds * 100000) return "Score is not plausible for this run time.";
+  if (runCombo > 1000 + elapsedSeconds * 100) return "Combo is not plausible for this run time.";
+  if (runWave > 1 + Math.floor(elapsedSeconds * 4)) return "Wave progress is too fast.";
+
+  if (kind === "score" && score !== runScore) return "Score does not match the active run.";
+  if (kind === "waves" && score !== runWave) return "Wave record does not match the active run.";
+  if (kind === "combo" && score !== runCombo) return "Combo does not match the active run.";
+  if (kind === "wave_times") {
+    if (wave < 1 || wave > runWave) return "Wave time does not belong to the active run.";
+    if (score !== waveTime) return "Wave time does not match the active run.";
+    if (score < 250 || score > 60 * 60 * 1000) return "Wave time is outside the allowed range.";
+    if (elapsedMs + 2000 < score) return "Wave time exceeds the active session time.";
+  }
+
+  if (!scoreLeaderboardId(kind, wave)) return "Leaderboard kind is not protected or configured.";
+  return "";
+}
+
+async function submitProtectedLootLockerScore(session, body) {
+  const kind = String(body.kind || "").toLowerCase();
+  const wave = Math.floor(Number(body.wave || 0));
+  const score = Math.floor(Number(body.score));
+  const leaderboardId = scoreLeaderboardId(kind, wave);
+  const lootLockerToken = String(body.lootlocker_session_token || "").trim();
+  if (!lootLockerToken) throw new Error("LootLocker session is missing.");
+
+  const fingerprint = `${kind}:${wave}:${score}`;
+  if (session.uploads.has(fingerprint)) return { score, duplicate: true };
+
+  const response = await fetch(`https://api.lootlocker.io/game/leaderboards/${leaderboardId}/submit`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-session-token": lootLockerToken
+    },
+    body: JSON.stringify({ score })
+  });
+  const responseText = await response.text().catch(() => "");
+  if (!response.ok) throw new Error(`LootLocker ${response.status}: ${responseText.slice(0, 160)}`);
+
+  session.uploads.add(fingerprint);
+  session.submissions += 1;
+  session.lastSeenAt = Date.now();
+  let result = {};
+  if (responseText.trim()) {
+    try { result = JSON.parse(responseText); } catch { result = {}; }
+  }
+  return { ...result, score, leaderboard_id: leaderboardId, protected: true };
+}
 
 function sendJson(res, status, body) {
   res.writeHead(status, {
@@ -732,8 +828,54 @@ const server = http.createServer(async (req, res) => {
       private_release_proxy: USE_RELEASE_PROXY,
       github_private_access_configured: Boolean(GITHUB_TOKEN),
       owner_auth_configured: Boolean(OWNER_SECRET),
+      protected_score_sessions: scoreSessions.size,
       uptime_seconds: Math.floor(process.uptime())
     });
+    return;
+  }
+
+  if (url.pathname === "/score-session/start" && req.method === "POST") {
+    cleanScoreSessions();
+    const body = await readJson(req);
+    const token = makeToken();
+    scoreSessions.set(token, {
+      createdAt: Date.now(),
+      lastSeenAt: Date.now(),
+      gameVersion: String(body.game_version || ""),
+      playerId: sanitizeId(body.player_id || ""),
+      submissions: 0,
+      uploads: new Set()
+    });
+    sendJson(res, 201, {
+      ok: true,
+      run_token: token,
+      expires_in_seconds: Math.floor(SCORE_SESSION_TTL_MS / 1000)
+    });
+    return;
+  }
+
+  if (url.pathname === "/score-session/submit" && req.method === "POST") {
+    cleanScoreSessions();
+    const body = await readJson(req);
+    const token = String(body.run_token || "");
+    const session = scoreSessions.get(token);
+    if (!session) {
+      sendJson(res, 401, { ok: false, message: "Secure run session is missing or expired." });
+      return;
+    }
+
+    const error = scoreSubmissionError(session, body);
+    if (error) {
+      sendJson(res, 422, { ok: false, message: error });
+      return;
+    }
+
+    try {
+      const result = await submitProtectedLootLockerScore(session, body);
+      sendJson(res, 200, { ok: true, ...result });
+    } catch (submitError) {
+      sendJson(res, 502, { ok: false, message: submitError.message || "LootLocker upload failed." });
+    }
     return;
   }
 
@@ -1219,6 +1361,7 @@ wss.on("connection", (ws, req) => {
 });
 
 setInterval(cleanupExpiredRooms, 30000);
+setInterval(cleanScoreSessions, 60000);
 
 server.listen(PORT, () => {
   console.log(`SpaceRocks Windows relay listening on ${PORT}`);
