@@ -837,11 +837,20 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/score-session/start" && req.method === "POST") {
     cleanScoreSessions();
     const body = await readJson(req);
+    const gameVersion = String(body.game_version || "0").trim();
+    if (!versionAllowed(gameVersion)) {
+      sendJson(res, 426, {
+        ok: false,
+        message: `SpaceRocks ${MIN_CLIENT_VERSION} or newer is required.`,
+        min_client_version: MIN_CLIENT_VERSION
+      });
+      return;
+    }
     const token = makeToken();
     scoreSessions.set(token, {
       createdAt: Date.now(),
       lastSeenAt: Date.now(),
-      gameVersion: String(body.game_version || ""),
+      gameVersion,
       playerId: sanitizeId(body.player_id || ""),
       submissions: 0,
       uploads: new Set()
