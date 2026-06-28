@@ -697,6 +697,13 @@ function connectionIpHash(ws) {
   return crypto.createHash("sha256").update(source).digest("hex").slice(0, 24);
 }
 
+function requestIpHash(req) {
+  const source = String((req && req.headers && req.headers["x-forwarded-for"]) || (req && req.socket && req.socket.remoteAddress) || "")
+    .split(",")[0].trim();
+  if (!source) return "";
+  return crypto.createHash("sha256").update(source).digest("hex").slice(0, 24);
+}
+
 function applyConnectionIdentity(ws, msg) {
   if (!ws) return;
   const onlineId = sanitizeId(msg && msg.player_id);
@@ -1530,6 +1537,42 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/version/check") {
+    const gameVersion = String(url.searchParams.get("game_version") || "0").trim();
+    const updateRequired = compareVersion(gameVersion, MIN_CLIENT_VERSION) < 0;
+    const unpublished = compareVersion(gameVersion, LATEST_VERSION) > 0;
+    sendJson(res, 200, {
+      ok: true,
+      access_allowed: !updateRequired && !unpublished,
+      update_required: updateRequired,
+      unpublished,
+      current_version: gameVersion,
+      latest_version: LATEST_VERSION,
+      min_client_version: MIN_CLIENT_VERSION,
+      release_url: RELEASE_URL,
+      download_url: publicDownloadUrl(req)
+    });
+    return;
+  }
+
+  if (url.pathname === "/player/check-ban") {
+    const auth = requireRequestAuth(req, res);
+    if (!auth) return;
+    const idRecord = bannedPlayers.get(`ID:${sanitizeId(auth.playerId)}`) || null;
+    const ipHash = requestIpHash(req);
+    const ipRecord = ipHash ? bannedPlayers.get(`IP:${ipHash}`) || null : null;
+    const record = idRecord || ipRecord;
+    sendJson(res, 200, {
+      ok: true,
+      banned: Boolean(record),
+      reason: record ? String(record.reason || "Kontosperre") : "",
+      created_at: record ? String(record.created_at || "") : "",
+      expires_at: record ? String(record.expires_at || "") : "",
+      permanent: record ? !record.expires_at : false
+    });
+    return;
+  }
+
   if (url.pathname === "/health") {
     sendJson(res, 200, {
       ok: true,
@@ -2257,4 +2300,3 @@ setInterval(cleanScoreSessions, 60000);
 server.listen(PORT, () => {
   console.log(`SpaceRocks Windows relay listening on ${PORT}`);
 });
-
