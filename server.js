@@ -1525,9 +1525,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === "/auth/start") {
+  if (url.pathname === "/auth/start" || url.pathname === "/auth/login-google" || url.pathname === "/auth/login-github") {
     cleanAuthState();
-    const provider = String(url.searchParams.get("provider") || "google").toLowerCase();
+    const provider = url.pathname === "/auth/login-google"
+      ? "google"
+      : url.pathname === "/auth/login-github"
+        ? "github"
+        : String(url.searchParams.get("provider") || "google").toLowerCase();
     const providerConfigured = provider === "google"
       ? googleAuthConfigured()
       : provider === "apple"
