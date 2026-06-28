@@ -31,12 +31,18 @@ const OWNER_ACCOUNT = String(process.env.SPACEROCKS_OWNER_ACCOUNT || "").toLower
 const SEEDED_BANS = process.env.SPACEROCKS_BANNED_PLAYERS || "";
 const GOOGLE_CLIENT_ID = process.env.SPACEROCKS_GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.SPACEROCKS_GOOGLE_CLIENT_SECRET || "";
+const GITHUB_OAUTH_CLIENT_ID = process.env.SPACEROCKS_GITHUB_OAUTH_CLIENT_ID || "";
+const GITHUB_OAUTH_CLIENT_SECRET = process.env.SPACEROCKS_GITHUB_OAUTH_CLIENT_SECRET || "";
 const APPLE_CLIENT_ID = process.env.SPACEROCKS_APPLE_CLIENT_ID || "";
 const APPLE_TEAM_ID = process.env.SPACEROCKS_APPLE_TEAM_ID || "";
 const APPLE_KEY_ID = process.env.SPACEROCKS_APPLE_KEY_ID || "";
 const APPLE_PRIVATE_KEY = String(process.env.SPACEROCKS_APPLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 const APPLE_CLIENT_SECRET = process.env.SPACEROCKS_APPLE_CLIENT_SECRET || "";
 const AUTH_REQUIRED = process.env.SPACEROCKS_AUTH_REQUIRED === "true";
+const AUTH_TOKEN_SECRET = process.env.SPACEROCKS_AUTH_TOKEN_SECRET || OWNER_SECRET;
+const CLOUD_GITHUB_REPO = process.env.SPACEROCKS_CLOUD_GITHUB_REPO || "spacerocks-windows-relay-server";
+const CLOUD_GITHUB_BRANCH = process.env.SPACEROCKS_CLOUD_GITHUB_BRANCH || "player-data";
+const CLOUD_GITHUB_PATH = process.env.SPACEROCKS_CLOUD_GITHUB_PATH || "cloud-saves.json";
 const AUTH_REQUEST_TTL_MS = 1000 * 60 * 10;
 const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 const SCORE_SESSION_TTL_MS = 1000 * 60 * 60 * 6;
@@ -377,12 +383,13 @@ function cleanAuthState() {
 
 function authSessionForToken(token) {
   cleanAuthState();
-  return authSessions.get(String(token || "")) || null;
+  return authSessions.get(String(token || "")) || signedAuthSessionForToken(token);
 }
 
 function accountOnlineId(session) {
   if (!session) return "";
-  return sanitizeId(`${session.provider === "apple" ? "A" : "G"}${session.provider_id || session.account_id}`);
+  const prefix = session.provider === "apple" ? "A" : session.provider === "github" ? "H" : "G";
+  return sanitizeId(`${prefix}${session.provider_id || session.account_id}`);
 }
 
 function requestAuthContext(req, requestedPlayerId = "") {
@@ -397,7 +404,7 @@ function requestAuthContext(req, requestedPlayerId = "") {
 function requireRequestAuth(req, res, requestedPlayerId = "") {
   const context = requestAuthContext(req, requestedPlayerId);
   if (context) return context;
-  sendJson(res, 401, { ok: false, message: "Bitte zuerst mit Google oder Apple anmelden." });
+  sendJson(res, 401, { ok: false, message: "Bitte zuerst mit Google, Apple oder GitHub anmelden." });
   return null;
 }
 
@@ -416,7 +423,7 @@ function authenticateSocket(ws, msg) {
     ws.accountId = ws.onlineId || "guest";
     return true;
   }
-  send(ws, { cmd: "auth_required", message: "Bitte zuerst mit Google oder Apple anmelden." });
+  send(ws, { cmd: "auth_required", message: "Bitte zuerst mit Google, Apple oder GitHub anmelden." });
   return false;
 }
 
@@ -428,8 +435,48 @@ function appleAuthConfigured() {
   return Boolean(APPLE_CLIENT_ID && (APPLE_CLIENT_SECRET || (APPLE_TEAM_ID && APPLE_KEY_ID && APPLE_PRIVATE_KEY)));
 }
 
+function githubAuthConfigured() {
+  return Boolean(GITHUB_OAUTH_CLIENT_ID && GITHUB_OAUTH_CLIENT_SECRET);
+}
+
 function base64Url(value) {
   return Buffer.from(value).toString("base64url");
+}
+
+function issueAuthSession(account) {
+  const createdAt = Date.now();
+  const session = { ...account, createdAt };
+  const payload = base64Url(JSON.stringify({ ...account, iat: createdAt, exp: createdAt + AUTH_SESSION_TTL_MS }));
+  if (!AUTH_TOKEN_SECRET) {
+    const temporaryToken = makeToken() + makeToken();
+    authSessions.set(temporaryToken, session);
+    return temporaryToken;
+  }
+  const signature = crypto.createHmac("sha256", AUTH_TOKEN_SECRET).update(payload).digest("base64url");
+  const token = `${payload}.${signature}`;
+  authSessions.set(token, session);
+  return token;
+}
+
+function signedAuthSessionForToken(token) {
+  if (!AUTH_TOKEN_SECRET) return null;
+  const parts = String(token || "").split(".");
+  if (parts.length !== 2) return null;
+  const expected = crypto.createHmac("sha256", AUTH_TOKEN_SECRET).update(parts[0]).digest();
+  let provided;
+  try { provided = Buffer.from(parts[1], "base64url"); } catch { return null; }
+  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) return null;
+  let payload;
+  try { payload = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")); } catch { return null; }
+  if (!payload || Number(payload.exp || 0) <= Date.now() || !payload.provider_id || !payload.provider) return null;
+  return {
+    provider: String(payload.provider),
+    provider_id: String(payload.provider_id),
+    account_id: String(payload.account_id || `${payload.provider}:${payload.provider_id}`),
+    email: String(payload.email || "").toLowerCase(),
+    name: sanitizeName(payload.name || payload.email || "SPIELER"),
+    createdAt: Number(payload.iat || Date.now())
+  };
 }
 
 function appleClientSecret() {
@@ -507,6 +554,50 @@ async function exchangeGoogleCode(code, redirectUri) {
   };
 }
 
+async function exchangeGithubCode(code, redirectUri) {
+  const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: GITHUB_OAUTH_CLIENT_ID,
+      client_secret: GITHUB_OAUTH_CLIENT_SECRET,
+      code: String(code || ""),
+      redirect_uri: redirectUri
+    })
+  });
+  const tokenData = await tokenResponse.json().catch(() => ({}));
+  if (!tokenResponse.ok || !tokenData.access_token) throw new Error("GitHub token exchange failed.");
+
+  const githubHeaders = {
+    "Accept": "application/vnd.github+json",
+    "Authorization": `Bearer ${tokenData.access_token}`,
+    "User-Agent": "SpaceRocks-Login",
+    "X-GitHub-Api-Version": "2022-11-28"
+  };
+  const profileResponse = await fetch("https://api.github.com/user", { headers: githubHeaders });
+  const profile = await profileResponse.json().catch(() => ({}));
+  if (!profileResponse.ok || !profile.id) throw new Error("GitHub identity verification failed.");
+
+  let email = String(profile.email || "").toLowerCase();
+  if (!email) {
+    const emailResponse = await fetch("https://api.github.com/user/emails", { headers: githubHeaders });
+    const emails = await emailResponse.json().catch(() => []);
+    if (emailResponse.ok && Array.isArray(emails)) {
+      const selected = emails.find((item) => item && item.primary && item.verified)
+        || emails.find((item) => item && item.verified);
+      if (selected) email = String(selected.email || "").toLowerCase();
+    }
+  }
+
+  return {
+    provider: "github",
+    provider_id: String(profile.id),
+    account_id: `github:${profile.id}`,
+    email,
+    name: sanitizeName(profile.name || profile.login || "SPIELER")
+  };
+}
+
 async function exchangeAppleCode(code, redirectUri, suppliedUser = "") {
   const tokenResponse = await fetch("https://appleid.apple.com/auth/token", {
     method: "POST",
@@ -534,6 +625,70 @@ async function exchangeAppleCode(code, redirectUri, suppliedUser = "") {
     email: String(claims.email || "").toLowerCase(),
     name: sanitizeName(suppliedName || claims.email || "SPIELER")
   };
+}
+
+let cloudSavesLoaded = false;
+let cloudSavePersistQueue = Promise.resolve();
+
+function cloudGithubHeaders() {
+  return {
+    "Accept": "application/vnd.github+json",
+    "Authorization": `Bearer ${GITHUB_TOKEN}`,
+    "User-Agent": "SpaceRocks-Cloud-Save",
+    "X-GitHub-Api-Version": "2022-11-28"
+  };
+}
+
+function cloudGithubUrl() {
+  const safePath = CLOUD_GITHUB_PATH.split("/").map(encodeURIComponent).join("/");
+  return `https://api.github.com/repos/${encodeURIComponent(GITHUB_OWNER)}/${encodeURIComponent(CLOUD_GITHUB_REPO)}/contents/${safePath}`;
+}
+
+async function ensureCloudSavesLoaded() {
+  if (cloudSavesLoaded) return;
+  if (!GITHUB_TOKEN) throw new Error("Cloud persistence token is missing.");
+  const response = await fetch(`${cloudGithubUrl()}?ref=${encodeURIComponent(CLOUD_GITHUB_BRANCH)}`, {
+    headers: cloudGithubHeaders()
+  });
+  if (response.status === 404) {
+    cloudSavesLoaded = true;
+    return;
+  }
+  const file = await response.json().catch(() => ({}));
+  if (!response.ok || !file.content) throw new Error("Cloud save storage could not be loaded.");
+  const parsed = JSON.parse(Buffer.from(String(file.content).replace(/\s/g, ""), "base64").toString("utf8"));
+  const saves = parsed && parsed.saves && typeof parsed.saves === "object" ? parsed.saves : {};
+  for (const [playerId, save] of Object.entries(saves)) {
+    if (save && typeof save === "object") cloudSaves.set(sanitizeId(playerId), save);
+  }
+  cloudSavesLoaded = true;
+}
+
+async function persistCloudSavesNow() {
+  if (!GITHUB_TOKEN) throw new Error("Cloud persistence token is missing.");
+  const readResponse = await fetch(`${cloudGithubUrl()}?ref=${encodeURIComponent(CLOUD_GITHUB_BRANCH)}`, {
+    headers: cloudGithubHeaders()
+  });
+  const current = await readResponse.json().catch(() => ({}));
+  if (!readResponse.ok && readResponse.status !== 404) throw new Error("Cloud save storage metadata could not be loaded.");
+  const saves = Object.fromEntries(cloudSaves.entries());
+  const body = {
+    message: "Update SpaceRocks account cloud saves",
+    content: Buffer.from(JSON.stringify({ version: 1, updated_at: new Date().toISOString(), saves }, null, 2)).toString("base64"),
+    branch: CLOUD_GITHUB_BRANCH
+  };
+  if (current.sha) body.sha = current.sha;
+  const writeResponse = await fetch(cloudGithubUrl(), {
+    method: "PUT",
+    headers: { ...cloudGithubHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!writeResponse.ok) throw new Error("Cloud save storage could not be persisted.");
+}
+
+function persistCloudSaves() {
+  cloudSavePersistQueue = cloudSavePersistQueue.catch(() => {}).then(() => persistCloudSavesNow());
+  return cloudSavePersistQueue;
 }
 
 function connectionIpHash(ws) {
@@ -1282,25 +1437,34 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/auth/start") {
     cleanAuthState();
     const provider = String(url.searchParams.get("provider") || "google").toLowerCase();
-    const providerConfigured = provider === "google" ? googleAuthConfigured() : provider === "apple" ? appleAuthConfigured() : false;
+    const providerConfigured = provider === "google"
+      ? googleAuthConfigured()
+      : provider === "apple"
+        ? appleAuthConfigured()
+        : provider === "github"
+          ? githubAuthConfigured()
+          : false;
     if (!providerConfigured) {
-      sendJson(res, 503, {
-        ok: false,
-        message: provider === "apple" ? "Apple Login ist noch nicht konfiguriert." : "Google Login ist noch nicht konfiguriert."
-      });
+      sendJson(res, 503, { ok: false, message: `${provider} Login ist noch nicht konfiguriert.` });
       return;
     }
     const state = makeToken();
     const redirectUri = `${serverOrigin(req)}/auth/callback/${provider}`;
     authRequests.set(state, { provider, status: "pending", createdAt: Date.now(), redirectUri });
-    const authUrl = new URL(provider === "apple" ? "https://appleid.apple.com/auth/authorize" : "https://accounts.google.com/o/oauth2/v2/auth");
-    authUrl.searchParams.set("client_id", provider === "apple" ? APPLE_CLIENT_ID : GOOGLE_CLIENT_ID);
+    const authEndpoint = provider === "apple"
+      ? "https://appleid.apple.com/auth/authorize"
+      : provider === "github"
+        ? "https://github.com/login/oauth/authorize"
+        : "https://accounts.google.com/o/oauth2/v2/auth";
+    const authUrl = new URL(authEndpoint);
+    const clientId = provider === "apple" ? APPLE_CLIENT_ID : provider === "github" ? GITHUB_OAUTH_CLIENT_ID : GOOGLE_CLIENT_ID;
+    authUrl.searchParams.set("client_id", clientId);
     authUrl.searchParams.set("redirect_uri", redirectUri);
     authUrl.searchParams.set("response_type", "code");
-    authUrl.searchParams.set("scope", provider === "apple" ? "name email" : "openid email profile");
+    authUrl.searchParams.set("scope", provider === "apple" ? "name email" : provider === "github" ? "read:user user:email" : "openid email profile");
     authUrl.searchParams.set("state", state);
     if (provider === "apple") authUrl.searchParams.set("response_mode", "form_post");
-    else authUrl.searchParams.set("prompt", "select_account");
+    else if (provider === "google") authUrl.searchParams.set("prompt", "select_account");
     sendJson(res, 200, { ok: true, provider, state, auth_url: authUrl.toString(), expires_in_seconds: 600 });
     return;
   }
@@ -1323,7 +1487,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === "/auth/callback/google" || url.pathname === "/auth/callback/apple") {
+  if (url.pathname === "/auth/callback/google" || url.pathname === "/auth/callback/apple" || url.pathname === "/auth/callback/github") {
     cleanAuthState();
     let callbackParams = url.searchParams;
     if (req.method === "POST") callbackParams = new URLSearchParams(await readBody(req));
@@ -1337,9 +1501,10 @@ const server = http.createServer(async (req, res) => {
       try {
         const account = request.provider === "apple"
           ? await exchangeAppleCode(code, request.redirectUri, callbackParams.get("user") || "")
-          : await exchangeGoogleCode(code, request.redirectUri);
-        const sessionToken = makeToken() + makeToken();
-        authSessions.set(sessionToken, { ...account, createdAt: Date.now() });
+          : request.provider === "github"
+            ? await exchangeGithubCode(code, request.redirectUri)
+            : await exchangeGoogleCode(code, request.redirectUri);
+        const sessionToken = issueAuthSession(account);
         request.status = "complete";
         request.sessionToken = sessionToken;
         request.account = account;
@@ -1354,6 +1519,14 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
     res.end(`<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;background:#06111c;color:#dff8ff;text-align:center;padding:80px"><h1>${title}</h1><p>${message}</p></body></html>`);
+    return;
+  }
+
+  if (url.pathname === "/auth/me") {
+    const auth = requireRequestAuth(req, res);
+    if (!auth || !auth.session) return;
+    const { provider, provider_id, account_id, email, name } = auth.session;
+    sendJson(res, 200, { ok: true, account: { provider, provider_id, account_id, email, name } });
     return;
   }
 
@@ -1374,6 +1547,8 @@ const server = http.createServer(async (req, res) => {
       auth_required: AUTH_REQUIRED,
       google_auth_configured: googleAuthConfigured(),
       apple_auth_configured: appleAuthConfigured(),
+      github_auth_configured: githubAuthConfigured(),
+      cloud_persistence_configured: Boolean(GITHUB_TOKEN && CLOUD_GITHUB_REPO && CLOUD_GITHUB_BRANCH),
       live_matches: liveMatches().length,
       active_spectators: Array.from(rooms.values()).reduce((sum, room) => sum + roomSpectators(room).length, 0),
       banned_players: publicBanList().length,
@@ -1595,6 +1770,10 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/cloud-save" && req.method === "GET") {
     const auth = requireRequestAuth(req, res, url.searchParams.get("player_id"));
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      sendJson(res, 503, { ok: false, message: error.message || "Cloud persistence unavailable." });
+      return;
+    }
     if (!auth) return;
     const playerId = auth.playerId;
     const save = playerId ? cloudSaves.get(playerId) : null;
@@ -1610,6 +1789,10 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/cloud-save" && req.method === "POST") {
     const body = await readJson(req);
     const auth = requireRequestAuth(req, res, body.player_id);
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      sendJson(res, 503, { ok: false, message: error.message || "Cloud persistence unavailable." });
+      return;
+    }
     if (!auth) return;
     const playerId = auth.playerId;
     if (!playerId || !body.data || typeof body.data !== "object") {
@@ -1625,7 +1808,12 @@ const server = http.createServer(async (req, res) => {
     };
 
     cloudSaves.set(playerId, save);
-    sendJson(res, 200, { ok: true, save });
+    try {
+      await persistCloudSaves();
+      sendJson(res, 200, { ok: true, save });
+    } catch (error) {
+      sendJson(res, 503, { ok: false, message: error.message || "Cloud save could not be persisted." });
+    }
     return;
   }
 
@@ -2069,3 +2257,4 @@ setInterval(cleanScoreSessions, 60000);
 server.listen(PORT, () => {
   console.log(`SpaceRocks Windows relay listening on ${PORT}`);
 });
+
