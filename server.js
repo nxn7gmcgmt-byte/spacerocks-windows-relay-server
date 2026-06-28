@@ -28,6 +28,10 @@ const USE_RELEASE_PROXY = process.env.SPACEROCKS_USE_RELEASE_PROXY !== "false";
 const OWNER_SECRET = process.env.SPACEROCKS_OWNER_SECRET || "";
 const OWNER_PLAYER_ID = String(process.env.SPACEROCKS_OWNER_PLAYER_ID || "").toUpperCase();
 const OWNER_ACCOUNT = String(process.env.SPACEROCKS_OWNER_ACCOUNT || "").toLowerCase();
+const OWNER_GOOGLE_SUB = String(process.env.SPACEROCKS_OWNER_GOOGLE_SUB || "").trim();
+const OWNER_GITHUB_ID = String(process.env.SPACEROCKS_OWNER_GITHUB_ID || "").trim();
+// Owner access is bound only to stable OAuth provider IDs stored on the backend.
+// Enable MFA on Google and GitHub, never share tokens, and never place OAuth secrets in GameMaker.
 const SEEDED_BANS = process.env.SPACEROCKS_BANNED_PLAYERS || "";
 const GOOGLE_CLIENT_ID = process.env.SPACEROCKS_GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.SPACEROCKS_GOOGLE_CLIENT_SECRET || "";
@@ -45,6 +49,7 @@ const CLOUD_GITHUB_BRANCH = process.env.SPACEROCKS_CLOUD_GITHUB_BRANCH || "playe
 const CLOUD_GITHUB_PATH = process.env.SPACEROCKS_CLOUD_GITHUB_PATH || "cloud-saves.json";
 const AUTH_REQUEST_TTL_MS = 1000 * 60 * 10;
 const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
+const ADMIN_RECHECK_SECONDS = 300;
 const SCORE_SESSION_TTL_MS = 1000 * 60 * 60 * 6;
 const SCORE_MAX_SUBMISSIONS = 260;
 
@@ -60,6 +65,8 @@ const replayByPlayer = new Map();
 const bannedPlayers = new Map();
 const authRequests = new Map();
 const authSessions = new Map();
+const staffRoles = new Map();
+const securityAuditLog = [];
 const serverNews = [
   {
     title: "Geschuetzte Online-Bestenlisten",
@@ -353,22 +360,83 @@ function sanitizeName(name) {
   return String(name || "SPIELER").replace(/[^\w \-]/g, "").slice(0, 18) || "SPIELER";
 }
 
-function ownerSecretMatches(value) {
-  if (!OWNER_SECRET) return false;
-  const provided = Buffer.from(String(value || ""));
-  const expected = Buffer.from(OWNER_SECRET);
-  return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
+const ROLE_PERMISSIONS = Object.freeze({
+  player: [],
+  helper: ["can_view_players", "can_view_reports"],
+  moderator: ["can_access_admin_room", "can_view_players", "can_view_reports", "can_warn", "can_kick", "can_mute"],
+  admin: ["can_access_admin_room", "can_view_players", "can_view_reports", "can_warn", "can_kick", "can_mute", "can_ban", "can_unban", "can_shadow_ban", "can_manage_leaderboard", "can_manage_economy", "can_manage_skins", "can_send_announcements", "can_manage_events", "can_manage_maintenance", "can_manage_beta_access", "can_view_audit_log"],
+  owner: ["can_access_admin_room", "can_view_players", "can_view_reports", "can_warn", "can_kick", "can_mute", "can_ban", "can_unban", "can_shadow_ban", "can_manage_leaderboard", "can_manage_economy", "can_manage_skins", "can_send_announcements", "can_manage_events", "can_manage_maintenance", "can_manage_beta_access", "can_view_audit_log", "can_manage_roles", "can_reset_progress", "can_use_dangerous_tools"]
+});
+
+function ownerIdentityConfigured() {
+  return Boolean(OWNER_GOOGLE_SUB || OWNER_GITHUB_ID);
+}
+
+function ownerSessionMatches(session) {
+  if (!session || !ownerIdentityConfigured()) return false;
+  const provider = String(session.provider || "").toLowerCase();
+  const providerId = String(session.provider_id || "").trim();
+  if (provider === "google" && OWNER_GOOGLE_SUB) return providerId === OWNER_GOOGLE_SUB;
+  if (provider === "github" && OWNER_GITHUB_ID) return providerId === OWNER_GITHUB_ID;
+  return false;
+}
+
+function roleForSession(session) {
+  if (!session) return "player";
+  if (ownerSessionMatches(session)) return "owner";
+  const stored = String(staffRoles.get(String(session.account_id || "")) || "player");
+  return Object.prototype.hasOwnProperty.call(ROLE_PERMISSIONS, stored) && stored !== "owner" ? stored : "player";
+}
+
+function permissionsForRole(role) {
+  return Array.from(ROLE_PERMISSIONS[String(role || "player")] || []);
+}
+
+function sessionHasPermission(session, permission) {
+  return permissionsForRole(roleForSession(session)).includes(String(permission || ""));
+}
+
+function publicRoleResponse(session) {
+  const role = roleForSession(session);
+  return {
+    account: {
+      provider: String(session.provider || ""),
+      provider_id: String(session.provider_id || ""),
+      account_id: String(session.account_id || ""),
+      email: String(session.email || ""),
+      name: String(session.name || "SPIELER")
+    },
+    role,
+    is_owner: role === "owner",
+    permissions: permissionsForRole(role),
+    session_expires_at: Number(session.expiresAt || (session.createdAt + AUTH_SESSION_TTL_MS)),
+    recheck_after_seconds: ADMIN_RECHECK_SECONDS
+  };
 }
 
 function ownerAccountMatches(ws) {
   if (!ws) return false;
-  if (OWNER_ACCOUNT) {
-    const accountId = String(ws.accountId || "").toLowerCase();
-    const accountEmail = String(ws.accountEmail || "").toLowerCase();
-    return accountId === OWNER_ACCOUNT || accountEmail === OWNER_ACCOUNT;
-  }
-  const safeId = sanitizeId(ws.onlineId);
-  return Boolean(OWNER_PLAYER_ID) && safeId === sanitizeId(OWNER_PLAYER_ID);
+  return ownerSessionMatches({
+    provider: ws.authProvider,
+    provider_id: ws.authProviderId,
+    account_id: ws.accountId
+  });
+}
+
+function auditSecurityEvent(type, session = null, details = {}) {
+  const entry = {
+    id: crypto.randomUUID(),
+    type: String(type || "security_event").slice(0, 80),
+    actor_account_id: session ? String(session.account_id || "") : "",
+    actor_provider: session ? String(session.provider || "") : "",
+    actor_role: roleForSession(session),
+    timestamp: new Date().toISOString(),
+    details: details && typeof details === "object" ? details : {}
+  };
+  securityAuditLog.unshift(entry);
+  if (securityAuditLog.length > 1000) securityAuditLog.length = 1000;
+  console.log(`[AUDIT] ${entry.type} actor=${entry.actor_account_id || "anonymous"} role=${entry.actor_role}`);
+  return entry;
 }
 
 function cleanAuthState() {
@@ -408,6 +476,18 @@ function requireRequestAuth(req, res, requestedPlayerId = "") {
   return null;
 }
 
+function requireRequestPermission(req, res, permission) {
+  const auth = requireRequestAuth(req, res);
+  if (!auth) return null;
+  if (sessionHasPermission(auth.session, permission)) {
+    auditSecurityEvent("admin_permission_check_success", auth.session, { permission: String(permission) });
+    return auth;
+  }
+  auditSecurityEvent("admin_permission_check_failure", auth.session, { permission: String(permission) });
+  sendJson(res, 403, { ok: false, message: "Permission denied." });
+  return null;
+}
+
 function authenticateSocket(ws, msg) {
   applyConnectionIdentity(ws, msg);
   const session = authSessionForToken(msg && msg.auth_token);
@@ -415,6 +495,8 @@ function authenticateSocket(ws, msg) {
     ws.authToken = String(msg.auth_token);
     ws.accountId = String(session.account_id || "");
     ws.accountEmail = String(session.email || "");
+    ws.authProvider = String(session.provider || "");
+    ws.authProviderId = String(session.provider_id || "");
     ws.playerName = sanitizeName(session.name || ws.playerName);
     ws.onlineId = accountOnlineId(session);
     return true;
@@ -445,8 +527,9 @@ function base64Url(value) {
 
 function issueAuthSession(account) {
   const createdAt = Date.now();
-  const session = { ...account, createdAt };
-  const payload = base64Url(JSON.stringify({ ...account, iat: createdAt, exp: createdAt + AUTH_SESSION_TTL_MS }));
+  const expiresAt = createdAt + AUTH_SESSION_TTL_MS;
+  const session = { ...account, createdAt, expiresAt };
+  const payload = base64Url(JSON.stringify({ ...account, iat: createdAt, exp: expiresAt }));
   if (!AUTH_TOKEN_SECRET) {
     const temporaryToken = makeToken() + makeToken();
     authSessions.set(temporaryToken, session);
@@ -475,7 +558,8 @@ function signedAuthSessionForToken(token) {
     account_id: String(payload.account_id || `${payload.provider}:${payload.provider_id}`),
     email: String(payload.email || "").toLowerCase(),
     name: sanitizeName(payload.name || payload.email || "SPIELER"),
-    createdAt: Number(payload.iat || Date.now())
+    createdAt: Number(payload.iat || Date.now()),
+    expiresAt: Number(payload.exp || 0)
   };
 }
 
@@ -1516,11 +1600,15 @@ const server = http.createServer(async (req, res) => {
         request.sessionToken = sessionToken;
         request.account = account;
         request.message = "Anmeldung erfolgreich.";
+        auditSecurityEvent(ownerSessionMatches(account) ? "owner_login_success" : "account_login_success", account, {
+          provider: request.provider
+        });
         title = "SpaceRocks Login erfolgreich";
         message = "Du kannst dieses Fenster schliessen und zu SpaceRocks zurueckkehren.";
       } catch (error) {
         request.status = "error";
         request.message = error.message || "Google Login fehlgeschlagen.";
+        auditSecurityEvent("owner_login_failure", null, { provider: request.provider, message: String(request.message).slice(0, 120) });
       }
     }
 
@@ -1529,11 +1617,74 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === "/auth/me") {
+  if (url.pathname === "/auth/me" || url.pathname === "/auth/current-user") {
     const auth = requireRequestAuth(req, res);
     if (!auth || !auth.session) return;
-    const { provider, provider_id, account_id, email, name } = auth.session;
-    sendJson(res, 200, { ok: true, account: { provider, provider_id, account_id, email, name } });
+    sendJson(res, 200, { ok: true, ...publicRoleResponse(auth.session) });
+    return;
+  }
+
+  if (url.pathname === "/auth/check-role" || url.pathname === "/auth/check-owner") {
+    const auth = requireRequestAuth(req, res);
+    if (!auth || !auth.session) return;
+    const response = publicRoleResponse(auth.session);
+    auditSecurityEvent(response.is_owner ? "owner_login_success" : "admin_permission_check_success", auth.session, {
+      endpoint: url.pathname
+    });
+    sendJson(res, 200, { ok: true, ...response });
+    return;
+  }
+
+  if (url.pathname === "/admin/roles/list") {
+    const auth = requireRequestPermission(req, res, "can_manage_roles");
+    if (!auth) return;
+    const roles = Array.from(staffRoles.entries()).map(([account_id, role]) => ({ account_id, role }));
+    sendJson(res, 200, { ok: true, roles });
+    return;
+  }
+
+  if (url.pathname === "/admin/roles/grant" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_manage_roles");
+    if (!auth) return;
+    const body = await readJson(req);
+    const accountId = String(body.account_id || "").trim().slice(0, 160);
+    const role = String(body.role || "").toLowerCase();
+    if (!accountId || !["helper", "moderator", "admin"].includes(role)) {
+      auditSecurityEvent("attempted_unauthorized_role_change", auth.session, { account_id: accountId, requested_role: role });
+      sendJson(res, 400, { ok: false, message: "Only helper, moderator or admin may be granted." });
+      return;
+    }
+    if (accountId === String(auth.session.account_id || "")) {
+      auditSecurityEvent("attempted_owner_self_promotion", auth.session, { requested_role: role });
+      sendJson(res, 400, { ok: false, message: "Self role changes are not allowed." });
+      return;
+    }
+    staffRoles.set(accountId, role);
+    auditSecurityEvent("role_granted", auth.session, { account_id: accountId, role });
+    sendJson(res, 200, { ok: true, account_id: accountId, role });
+    return;
+  }
+
+  if (url.pathname === "/admin/roles/revoke" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_manage_roles");
+    if (!auth) return;
+    const body = await readJson(req);
+    const accountId = String(body.account_id || "").trim().slice(0, 160);
+    if (!accountId || accountId === String(auth.session.account_id || "")) {
+      auditSecurityEvent("attempted_unauthorized_role_change", auth.session, { account_id: accountId, action: "revoke" });
+      sendJson(res, 400, { ok: false, message: "This role cannot be revoked here." });
+      return;
+    }
+    const removed = staffRoles.delete(accountId);
+    auditSecurityEvent("role_revoked", auth.session, { account_id: accountId, removed });
+    sendJson(res, 200, { ok: true, account_id: accountId, removed });
+    return;
+  }
+
+  if (url.pathname === "/admin/audit/log") {
+    const auth = requireRequestPermission(req, res, "can_view_audit_log");
+    if (!auth) return;
+    sendJson(res, 200, { ok: true, entries: securityAuditLog.slice(0, 200) });
     return;
   }
 
@@ -1585,8 +1736,8 @@ const server = http.createServer(async (req, res) => {
       download_url: publicDownloadUrl(req),
       private_release_proxy: USE_RELEASE_PROXY,
       github_private_access_configured: Boolean(GITHUB_TOKEN),
-      owner_auth_configured: Boolean(OWNER_SECRET),
-      owner_account_configured: Boolean(OWNER_ACCOUNT || OWNER_PLAYER_ID),
+      owner_auth_configured: ownerIdentityConfigured(),
+      owner_account_configured: ownerIdentityConfigured(),
       auth_required: AUTH_REQUIRED,
       google_auth_configured: googleAuthConfigured(),
       apple_auth_configured: appleAuthConfigured(),
@@ -1890,6 +2041,8 @@ wss.on("connection", (ws, req) => {
   ws.playerName = "SPIELER";
   ws.accountId = "";
   ws.accountEmail = "";
+  ws.authProvider = "";
+  ws.authProviderId = "";
   ws.authToken = "";
   ws.isSpectator = false;
   ws.remoteAddress = String((req.socket && req.socket.remoteAddress) || req.headers["x-forwarded-for"] || "").split(",")[0].trim();
@@ -1904,8 +2057,13 @@ wss.on("connection", (ws, req) => {
 
     if (msg.cmd === "owner_auth") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
-      const authorized = ownerSecretMatches(msg.secret) && ownerAccountMatches(ws);
+      const session = authSessionForToken(ws.authToken);
+      const authorized = ownerSessionMatches(session);
       ws.isOwner = authorized;
+
+      auditSecurityEvent(authorized ? "owner_login_success" : "owner_login_failure", session, {
+        source: "multiplayer_owner_console"
+      });
 
       if (authorized && room && ws.playerId >= 0) {
         room.ownerPlayerId = ws.playerId;
@@ -1916,21 +2074,28 @@ wss.on("connection", (ws, req) => {
         cmd: "owner_status",
         authorized,
         player: authorized ? ws.playerId : -1,
-        message: authorized ? "Owner access granted." : "Owner access denied: falscher Account oder Key."
+        message: authorized ? "Owner access granted." : "Owner access denied."
       });
       return;
     }
 
     if (msg.cmd === "owner_command") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
-      if (!room || !ws.isOwner || room.ownerPlayerId !== ws.playerId) {
+      const session = authSessionForToken(ws.authToken);
+      const stillOwner = ownerSessionMatches(session);
+      if (!room || !ws.isOwner || !stillOwner || room.ownerPlayerId !== ws.playerId) {
+        ws.isOwner = false;
+        auditSecurityEvent("admin_permission_check_failure", session, { permission: "owner_command" });
         send(ws, { cmd: "owner_status", authorized: false, player: -1, message: "Owner command denied." });
         return;
       }
 
+      auditSecurityEvent("admin_permission_check_success", session, { permission: "owner_command" });
+
       const commandText = String(msg.text || "").trim().slice(0, 120);
       const parts = commandText.split(/\s+/);
       const command = String(parts.shift() || "").replace(/^\//, "").toLowerCase();
+      auditSecurityEvent("owner_command", session, { command });
 
       if (command === "heal") {
         broadcastRoom(room, { cmd: "owner_command", command: "heal", player: ws.playerId });
