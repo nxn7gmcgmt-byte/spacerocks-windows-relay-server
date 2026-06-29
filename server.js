@@ -55,6 +55,10 @@ const SCORE_MAX_SUBMISSIONS = 260;
 
 const rooms = new Map();
 const scoreSessions = new Map();
+const securityProfiles = new Map();
+const securityReports = [];
+const leaderboardSoftBans = new Set();
+const shadowBans = new Set();
 const matchHistory = [];
 const cloudSaves = new Map();
 const friendLists = new Map();
@@ -67,6 +71,8 @@ const authRequests = new Map();
 const authSessions = new Map();
 const staffRoles = new Map();
 const securityAuditLog = [];
+const warningsByPlayer = new Map();
+const mutesByPlayer = new Map();
 const serverNews = [
   {
     title: "Geschuetzte Online-Bestenlisten",
@@ -108,6 +114,231 @@ function cleanScoreSessions() {
   }
 }
 
+function defaultSecurityProfile(playerId) {
+  return {
+    version: 1,
+    player_id: sanitizeId(playerId),
+    coins: 0,
+    player_skin_owned_mask: 1,
+    player_skin_active: 0,
+    rainbow_skin_unlocked: false,
+    rainbow_shots_unlocked: false,
+    upgrades: {},
+    inventory: {},
+    daily: { current_day: 1, processed_epoch_day: Math.floor(Date.now() / 86400000), last_claim_epoch_day: -1 },
+    updated_at: new Date().toISOString()
+  };
+}
+
+function boundedInt(value, minimum, maximum, fallback = minimum) {
+  const parsed = Math.floor(Number(value));
+  return Number.isSafeInteger(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback;
+}
+
+function migrateSecurityProfile(playerId, save) {
+  const profile = defaultSecurityProfile(playerId);
+  const stored = save && save.server_security && typeof save.server_security === "object" ? save.server_security : null;
+  const legacy = save && save.data && typeof save.data === "object" ? save.data : null;
+  const source = stored || legacy;
+  if (!source) return profile;
+  profile.coins = boundedInt(source.coins, 0, 100000000, 0);
+  profile.player_skin_owned_mask = boundedInt(source.player_skin_owned_mask, 1, 1023, 1) | 1;
+  profile.player_skin_active = boundedInt(source.player_skin_active, 0, 8, 0);
+  profile.rainbow_skin_unlocked = source.rainbow_skin_unlocked === true;
+  profile.rainbow_shots_unlocked = source.rainbow_shots_unlocked === true;
+  profile.upgrades = source.upgrades && typeof source.upgrades === "object" ? { ...source.upgrades } : {};
+  const upgradeLimits = { hp_upgrades: 20, shop_drone_level: 3, upgrade_shield_level: 5, upgrade_magnet_level: 5, upgrade_speed_level: 5, upgrade_fire_rate_level: 5, upgrade_damage_level: 5, upgrade_coin_level: 5, upgrade_critical_level: 5, upgrade_dash_level: 3, upgrade_nuke_level: 5, upgrade_power_level: 5 };
+  for (const [key, maximum] of Object.entries(upgradeLimits)) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) profile.upgrades[key] = boundedInt(source[key], 0, maximum, 0);
+    else profile.upgrades[key] = boundedInt(profile.upgrades[key], 0, maximum, 0);
+  }
+  profile.inventory = source.inventory && typeof source.inventory === "object" ? { ...source.inventory } : {};
+  profile.inventory.shop_spread = source.shop_spread === true || profile.inventory.shop_spread === true;
+  profile.inventory.shop_big_bullets = source.shop_big_bullets === true || profile.inventory.shop_big_bullets === true;
+  profile.inventory.shop_nuke = source.shop_nuke === true || profile.inventory.shop_nuke === true;
+  profile.inventory.has_lightning = source.has_lightning === true || profile.inventory.has_lightning === true;
+  if (source.daily && typeof source.daily === "object") {
+    const today = Math.floor(Date.now() / 86400000);
+    profile.daily.current_day = boundedInt(source.daily.current_day, 1, 30, 1);
+    profile.daily.processed_epoch_day = boundedInt(source.daily.processed_epoch_day, 0, today, today);
+    profile.daily.last_claim_epoch_day = boundedInt(source.daily.last_claim_epoch_day, -1, today, -1);
+  } else {
+    profile.daily.current_day = boundedInt(source.daily_reward_day, 1, 30, 1);
+  }
+  return profile;
+}
+
+function securityProfileFor(playerId) {
+  const safeId = sanitizeId(playerId);
+  if (!securityProfiles.has(safeId)) {
+    securityProfiles.set(safeId, migrateSecurityProfile(safeId, cloudSaves.get(safeId)));
+  }
+  return securityProfiles.get(safeId);
+}
+
+function applySecurityProfile(data, profile) {
+  const result = data && typeof data === "object" && !Array.isArray(data) ? { ...data } : {};
+  result.coins = profile.coins;
+  result.player_skin_owned_mask = profile.player_skin_owned_mask;
+  result.player_skin_active = (profile.player_skin_owned_mask & (1 << profile.player_skin_active)) !== 0 ? profile.player_skin_active : 0;
+  result.rainbow_skin_unlocked = profile.rainbow_skin_unlocked;
+  result.rainbow_shots_unlocked = profile.rainbow_shots_unlocked;
+  for (const [key, value] of Object.entries(profile.upgrades)) result[key] = value;
+  for (const [key, value] of Object.entries(profile.inventory)) result[key] = value === true;
+  result.shop_drone = boundedInt(profile.upgrades.shop_drone_level, 0, 3, 0) > 0;
+  result.shop_ghost = boundedInt(profile.upgrades.upgrade_shield_level, 0, 5, 0) > 0;
+  result.daily_reward_day = boundedInt(profile.daily.current_day, 1, 30, 1);
+  return result;
+}
+
+function advanceDailyDay(day, steps) {
+  return ((boundedInt(day, 1, 30, 1) - 1 + Math.max(0, Math.floor(steps))) % 30) + 1;
+}
+
+function applyValidatedDailyTransition(profile, incoming) {
+  const today = Math.floor(Date.now() / 86400000);
+  const daily = profile.daily || { current_day: 1, processed_epoch_day: today, last_claim_epoch_day: -1 };
+  const elapsed = Math.max(0, today - boundedInt(daily.processed_epoch_day, 0, today, today));
+  if (elapsed > 0) {
+    const missed = Math.max(0, elapsed - (daily.last_claim_epoch_day === daily.processed_epoch_day ? 1 : 0));
+    daily.current_day = advanceDailyDay(daily.current_day, missed);
+    daily.processed_epoch_day = today;
+  }
+
+  const requestedDay = boundedInt(incoming.daily_reward_day, 1, 30, daily.current_day);
+  const expectedNext = advanceDailyDay(daily.current_day, 1);
+  if (requestedDay === expectedNext && daily.last_claim_epoch_day !== today) {
+    const rewardDay = daily.current_day;
+    const coinValues = [100,150,200,250,300,350,500,550,600,750,800,850,900,1000,1200,1300,1400,1500,1600,1800,2000,2200,2400,2600,3000,3250,3500,4000,5000];
+    if (rewardDay === 5 && !profile.rainbow_shots_unlocked) {
+      profile.rainbow_shots_unlocked = true;
+      profile.player_skin_owned_mask |= (1 << 9);
+    } else if (rewardDay === 30 && !profile.rainbow_skin_unlocked) {
+      profile.rainbow_skin_unlocked = true;
+      profile.player_skin_owned_mask |= (1 << 8);
+    } else {
+      profile.coins = boundedInt(profile.coins + (rewardDay === 30 ? 15000 : coinValues[Math.min(28, rewardDay - 1)]), 0, 100000000, profile.coins);
+    }
+    daily.current_day = expectedNext;
+    daily.last_claim_epoch_day = today;
+    daily.processed_epoch_day = today;
+    profile.daily = daily;
+    return { granted: true, reward_day: rewardDay };
+  }
+
+  profile.daily = daily;
+  return { granted: false, reward_day: 0 };
+}
+
+function shopUpgradeCost(key, level) {
+  let oldPrice = 0;
+  if (key === "hp_upgrades") oldPrice = 180 + level * 90;
+  else if (key === "upgrade_damage_level") oldPrice = 390 + level * 270;
+  else if (key === "upgrade_coin_level") oldPrice = 450 + level * 300;
+  else if (key === "upgrade_shield_level") oldPrice = 825 + level * 300;
+  else if (key === "upgrade_magnet_level") oldPrice = 360 + level * 210;
+  else if (key === "upgrade_speed_level") oldPrice = 420 + level * 240;
+  else if (key === "upgrade_fire_rate_level") oldPrice = 480 + level * 270;
+  else if (key === "upgrade_critical_level") oldPrice = 600 + level * 360;
+  else if (key === "upgrade_dash_level") oldPrice = 750 + level * 450;
+  else if (key === "upgrade_nuke_level") oldPrice = 540 + level * 330;
+  else if (key === "upgrade_power_level") oldPrice = 510 + level * 315;
+  else if (key === "shop_drone_level") oldPrice = level <= 0 ? 1230 : level === 1 ? 1890 : 2550;
+  return Math.ceil(oldPrice * 3);
+}
+
+function validateAndApplyProtectedTransition(profile, incoming) {
+  if (!incoming || typeof incoming !== "object") return { ok: false, reason: "Missing save data." };
+  const upgradeLimits = { hp_upgrades: 20, shop_drone_level: 3, upgrade_shield_level: 5, upgrade_magnet_level: 5, upgrade_speed_level: 5, upgrade_fire_rate_level: 5, upgrade_damage_level: 5, upgrade_coin_level: 5, upgrade_critical_level: 5, upgrade_dash_level: 3, upgrade_nuke_level: 5, upgrade_power_level: 5 };
+  const inventoryCosts = { shop_spread: 2025, shop_big_bullets: 2925, shop_nuke: 4050, has_lightning: 3150 };
+  let expectedCost = 0;
+  const nextUpgrades = { ...profile.upgrades };
+  const nextInventory = { ...profile.inventory };
+  const dailyResult = applyValidatedDailyTransition(profile, incoming);
+
+  for (const [key, maximum] of Object.entries(upgradeLimits)) {
+    const current = boundedInt(profile.upgrades[key], 0, maximum, 0);
+    const desired = boundedInt(incoming[key], 0, maximum, current);
+    if (desired < current) return { ok: false, reason: `${key} cannot decrease from the client.` };
+    for (let level = current; level < desired; level += 1) expectedCost += shopUpgradeCost(key, level);
+    nextUpgrades[key] = desired;
+  }
+
+  for (const [key, cost] of Object.entries(inventoryCosts)) {
+    const current = profile.inventory[key] === true;
+    const desired = incoming[key] === true;
+    if (current && !desired) return { ok: false, reason: `${key} cannot be removed from the client.` };
+    if (!current && desired) expectedCost += cost;
+    nextInventory[key] = current || desired;
+  }
+
+  const currentMask = boundedInt(profile.player_skin_owned_mask, 1, 1023, 1) | 1;
+  const desiredMask = boundedInt(incoming.player_skin_owned_mask, 1, 1023, currentMask) | 1;
+  if ((desiredMask & currentMask) !== currentMask) return { ok: false, reason: "Owned skins cannot be removed from the client." };
+  const newSkinBits = desiredMask & ~currentMask;
+  if ((newSkinBits & ((1 << 8) | (1 << 9))) !== 0) return { ok: false, reason: "Reward-only Rainbow unlock was not granted by the server." };
+  for (let skin = 1; skin <= 7; skin += 1) if ((newSkinBits & (1 << skin)) !== 0) expectedCost += 30000;
+
+  if (incoming.rainbow_skin_unlocked === true && !profile.rainbow_skin_unlocked) return { ok: false, reason: "Rainbow skin unlock source is invalid." };
+  if (incoming.rainbow_shots_unlocked === true && !profile.rainbow_shots_unlocked) return { ok: false, reason: "Rainbow shots unlock source is invalid." };
+
+  const desiredCoins = boundedInt(incoming.coins, 0, 100000000, profile.coins);
+  if (desiredCoins !== profile.coins - expectedCost) return { ok: false, reason: "Coin change does not match validated purchases." };
+
+  profile.coins = desiredCoins;
+  profile.upgrades = nextUpgrades;
+  profile.inventory = nextInventory;
+  profile.player_skin_owned_mask = desiredMask;
+  const requestedActive = boundedInt(incoming.player_skin_active, 0, 8, profile.player_skin_active);
+  if ((desiredMask & (1 << requestedActive)) !== 0) profile.player_skin_active = requestedActive;
+  profile.updated_at = new Date().toISOString();
+  return { ok: true, purchase_cost: expectedCost, daily_reward_granted: dailyResult.granted, daily_reward_day: dailyResult.reward_day };
+}
+
+function recordSecurityReport(type, auth, details = {}) {
+  const report = {
+    id: crypto.randomUUID(),
+    type: String(type || "tamper").slice(0, 80),
+    player_id: auth ? sanitizeId(auth.playerId) : "",
+    account_id: auth && auth.session ? String(auth.session.account_id || "") : "",
+    details: details && typeof details === "object" ? details : {},
+    created_at: new Date().toISOString(),
+    status: "open"
+  };
+  securityReports.unshift(report);
+  if (securityReports.length > 1000) securityReports.length = 1000;
+  auditSecurityEvent("suspicious_modified_client_behavior", auth && auth.session, { report_id: report.id, type: report.type });
+  return report;
+}
+
+function activeBanForAuth(auth) {
+  if (!auth) return null;
+  return bannedPlayers.get(`ID:${sanitizeId(auth.playerId)}`) || null;
+}
+
+function runValidationError(session, summary, requireTelemetry = true) {
+  if (!session) return "Run does not exist.";
+  const elapsedMs = Math.max(0, Date.now() - session.createdAt);
+  const elapsedSeconds = elapsedMs / 1000;
+  const score = boundedInt(summary.run_score, 0, 2000000000, -1);
+  const wave = boundedInt(summary.run_wave, 0, 200, -1);
+  const combo = boundedInt(summary.run_combo, 0, 100000, -1);
+  const coins = boundedInt(summary.run_coins, 0, 100000000, -1);
+  if (score < 0 || wave < 0 || combo < 0 || coins < 0) return "Run summary contains invalid values.";
+  if (elapsedSeconds < 1 && (score > 0 || wave > 1 || coins > 0)) return "Run ended too quickly.";
+  if (score > 25000 + elapsedSeconds * 30000) return "Score rate is not plausible.";
+  if (coins > 500 + elapsedSeconds * 250) return "Coin rate is not plausible.";
+  if (wave > 1 + Math.floor(elapsedSeconds / 2)) return "Wave progression is not plausible.";
+  if (combo > 100 + elapsedSeconds * 30) return "Combo is not plausible.";
+  if (requireTelemetry && session.progressReports <= 0 && (score > 0 || coins > 0 || wave > 1)) return "Run has no server telemetry.";
+  if (requireTelemetry && session.progressReports > 0) {
+    if (score !== session.progress.score || wave !== session.progress.wave || combo !== session.progress.combo || coins !== session.progress.coins) {
+      return "Run summary does not match server telemetry.";
+    }
+  }
+  return "";
+}
+
 function scoreSubmissionError(session, body) {
   const kind = String(body.kind || "").toLowerCase();
   const score = Math.floor(Number(body.score));
@@ -119,9 +350,13 @@ function scoreSubmissionError(session, body) {
   const elapsedMs = Math.max(0, Date.now() - session.createdAt);
   const elapsedSeconds = elapsedMs / 1000;
 
+  if (session.state !== "ended" && session.state !== "submitted") return "Run must be ended before submission.";
+  if (!session.summary) return "Validated run summary is missing.";
+
   if (!Number.isSafeInteger(score) || score <= 0) return "Invalid score.";
   if (session.submissions >= SCORE_MAX_SUBMISSIONS) return "Too many submissions for this run.";
   if (runScore < 0 || runWave < 0 || runCombo < 0) return "Invalid run summary.";
+  if (runScore !== session.summary.run_score || runWave !== session.summary.run_wave || runCombo !== session.summary.run_combo) return "Submitted result does not match the ended run.";
   if (runWave > 200) return "Wave is outside the supported range.";
   if (runScore > 50000 + elapsedSeconds * 100000) return "Score is not plausible for this run time.";
   if (runCombo > 1000 + elapsedSeconds * 100) return "Combo is not plausible for this run time.";
@@ -138,6 +373,8 @@ function scoreSubmissionError(session, body) {
   }
 
   if (!scoreLeaderboardId(kind, wave)) return "Leaderboard kind is not protected or configured.";
+  const fingerprint = `${kind}:${wave}:${score}`;
+  if (session.uploads.has(fingerprint)) return "This run result was already submitted.";
   return "";
 }
 
@@ -150,8 +387,6 @@ async function submitProtectedLootLockerScore(session, body) {
   if (!lootLockerToken) throw new Error("LootLocker session is missing.");
 
   const fingerprint = `${kind}:${wave}:${score}`;
-  if (session.uploads.has(fingerprint)) return { score, duplicate: true };
-
   const response = await fetch(`https://api.lootlocker.io/game/leaderboards/${leaderboardId}/submit`, {
     method: "POST",
     headers: {
@@ -166,6 +401,7 @@ async function submitProtectedLootLockerScore(session, body) {
   session.uploads.add(fingerprint);
   session.submissions += 1;
   session.lastSeenAt = Date.now();
+  session.state = "submitted";
   let result = {};
   if (responseText.trim()) {
     try { result = JSON.parse(responseText); } catch { result = {}; }
@@ -745,6 +981,34 @@ async function ensureCloudSavesLoaded() {
   for (const [playerId, save] of Object.entries(saves)) {
     if (save && typeof save === "object") cloudSaves.set(sanitizeId(playerId), save);
   }
+  const roles = parsed && parsed.roles && typeof parsed.roles === "object" ? parsed.roles : {};
+  for (const [accountId, role] of Object.entries(roles)) {
+    const safeRole = String(role || "player").toLowerCase();
+    if (["helper", "moderator", "admin"].includes(safeRole)) staffRoles.set(String(accountId), safeRole);
+  }
+  const audit = parsed && Array.isArray(parsed.audit) ? parsed.audit.slice(0, 1000) : [];
+  for (const entry of audit) if (entry && typeof entry === "object") securityAuditLog.push(entry);
+  const moderation = parsed && parsed.moderation && typeof parsed.moderation === "object" ? parsed.moderation : {};
+  for (const record of Array.isArray(moderation.bans) ? moderation.bans : []) {
+    const playerId = sanitizeId(record && record.player_id);
+    if (playerId) bannedPlayers.set(`ID:${playerId}`, { ...record, player_id: playerId });
+  }
+  for (const [playerId, entries] of Object.entries(moderation.warnings || {})) {
+    const safeId = sanitizeId(playerId);
+    if (safeId && Array.isArray(entries)) warningsByPlayer.set(safeId, entries.slice(0, 50));
+  }
+  for (const [playerId, record] of Object.entries(moderation.mutes || {})) {
+    const safeId = sanitizeId(playerId);
+    if (safeId && record && typeof record === "object") mutesByPlayer.set(safeId, record);
+  }
+  for (const playerId of Array.isArray(moderation.shadow_bans) ? moderation.shadow_bans : []) {
+    const safeId = sanitizeId(playerId);
+    if (safeId) shadowBans.add(safeId);
+  }
+  for (const playerId of Array.isArray(moderation.leaderboard_soft_bans) ? moderation.leaderboard_soft_bans : []) {
+    const safeId = sanitizeId(playerId);
+    if (safeId) leaderboardSoftBans.add(safeId);
+  }
   cloudSavesLoaded = true;
 }
 
@@ -756,9 +1020,17 @@ async function persistCloudSavesNow() {
   const current = await readResponse.json().catch(() => ({}));
   if (!readResponse.ok && readResponse.status !== 404) throw new Error("Cloud save storage metadata could not be loaded.");
   const saves = Object.fromEntries(cloudSaves.entries());
+  const roles = Object.fromEntries(staffRoles.entries());
+  const moderation = {
+    bans: publicBanList(),
+    warnings: Object.fromEntries(warningsByPlayer.entries()),
+    mutes: Object.fromEntries(mutesByPlayer.entries()),
+    shadow_bans: Array.from(shadowBans),
+    leaderboard_soft_bans: Array.from(leaderboardSoftBans)
+  };
   const body = {
     message: "Update SpaceRocks account cloud saves",
-    content: Buffer.from(JSON.stringify({ version: 1, updated_at: new Date().toISOString(), saves }, null, 2)).toString("base64"),
+    content: Buffer.from(JSON.stringify({ version: 3, updated_at: new Date().toISOString(), saves, roles, moderation, audit: securityAuditLog.slice(0, 1000) }, null, 2)).toString("base64"),
     branch: CLOUD_GITHUB_BRANCH
   };
   if (current.sha) body.sha = current.sha;
@@ -852,6 +1124,91 @@ function publicBanList() {
     if (record && record.player_id) unique.set(record.player_id, record);
   }
   return Array.from(unique.values()).slice(0, 50);
+}
+
+function onlineSocketForPlayer(playerId) {
+  const safeId = sanitizeId(playerId);
+  if (!safeId || typeof wss === "undefined") return null;
+  for (const socket of wss.clients) {
+    if (sanitizeId(socket.onlineId) === safeId && socket.readyState === WebSocket.OPEN) return socket;
+  }
+  return null;
+}
+
+function knownPlayerRecords() {
+  const records = new Map();
+  const add = (playerId, name = "SPIELER", accountId = "") => {
+    const safeId = sanitizeId(playerId);
+    if (!safeId) return;
+    const previous = records.get(safeId) || {};
+    records.set(safeId, {
+      player_id: safeId,
+      player_name: sanitizeName(name || previous.player_name || safeId),
+      account_id: String(accountId || previous.account_id || ""),
+      online: Boolean(onlineSocketForPlayer(safeId)),
+      banned: bannedPlayers.has(`ID:${safeId}`),
+      muted: mutesByPlayer.has(safeId),
+      shadow_banned: shadowBans.has(safeId),
+      leaderboard_soft_banned: leaderboardSoftBans.has(safeId),
+      warnings: (warningsByPlayer.get(safeId) || []).length
+    });
+  };
+  for (const [playerId, save] of cloudSaves.entries()) add(playerId, save && save.player_name, save && save.account_id);
+  for (const session of authSessions.values()) add(accountOnlineId(session), session.name, session.account_id);
+  if (typeof wss !== "undefined") for (const socket of wss.clients) add(socket.onlineId, socket.playerName, socket.accountId);
+  for (const record of publicBanList()) add(record.player_id, record.player_name, "");
+  return Array.from(records.values());
+}
+
+function adminPlayerProfile(playerId) {
+  const safeId = sanitizeId(playerId);
+  if (!safeId) return null;
+  const base = knownPlayerRecords().find((entry) => entry.player_id === safeId) || {
+    player_id: safeId,
+    player_name: safeId,
+    account_id: "",
+    online: false,
+    banned: false,
+    muted: false,
+    shadow_banned: false,
+    leaderboard_soft_banned: false,
+    warnings: 0
+  };
+  const save = cloudSaves.get(safeId) || null;
+  const security = securityProfiles.has(safeId) ? securityProfiles.get(safeId) : (save ? securityProfileFor(safeId) : null);
+  const ban = bannedPlayers.get(`ID:${safeId}`) || null;
+  return {
+    ...base,
+    ban,
+    mute: mutesByPlayer.get(safeId) || null,
+    warning_history: warningsByPlayer.get(safeId) || [],
+    coins: security ? security.coins : 0,
+    active_skin: security ? security.player_skin_active : 0,
+    owned_skin_mask: security ? security.player_skin_owned_mask : 1,
+    rainbow_skin_unlocked: security ? security.rainbow_skin_unlocked : false,
+    trust_score: Math.max(0, 100 - (warningsByPlayer.get(safeId) || []).length * 8 - (shadowBans.has(safeId) ? 40 : 0)),
+    client_version: onlineSocketForPlayer(safeId) ? String(onlineSocketForPlayer(safeId).gameVersion || "online") : "offline"
+  };
+}
+
+function disconnectPlayer(playerId, message) {
+  const socket = onlineSocketForPlayer(playerId);
+  if (!socket) return false;
+  send(socket, { cmd: "admin_disconnect", message: String(message || "Von einem Moderator getrennt.").slice(0, 160) });
+  setTimeout(() => { try { socket.close(4004, "Admin action"); } catch {} }, 25);
+  return true;
+}
+
+function invalidatePlayerSessions(playerId) {
+  const safeId = sanitizeId(playerId);
+  let removed = 0;
+  for (const [token, session] of authSessions.entries()) {
+    if (accountOnlineId(session) === safeId) {
+      authSessions.delete(token);
+      removed += 1;
+    }
+  }
+  return removed;
 }
 
 for (const seededId of String(SEEDED_BANS).split(",")) {
@@ -1631,6 +1988,11 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/auth/check-role" || url.pathname === "/auth/check-owner") {
     const auth = requireRequestAuth(req, res);
     if (!auth || !auth.session) return;
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      auditSecurityEvent("backend_validation_failure", auth.session, { endpoint: url.pathname });
+      sendJson(res, 503, { ok: false, message: "Role storage unavailable." });
+      return;
+    }
     const response = publicRoleResponse(auth.session);
     auditSecurityEvent(response.is_owner ? "owner_login_success" : "admin_permission_check_success", auth.session, {
       endpoint: url.pathname
@@ -1663,9 +2025,16 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 400, { ok: false, message: "Self role changes are not allowed." });
       return;
     }
+    const previousRole = staffRoles.get(accountId);
     staffRoles.set(accountId, role);
     auditSecurityEvent("role_granted", auth.session, { account_id: accountId, role });
-    sendJson(res, 200, { ok: true, account_id: accountId, role });
+    try {
+      await persistCloudSaves();
+      sendJson(res, 200, { ok: true, account_id: accountId, role });
+    } catch (error) {
+      if (previousRole) staffRoles.set(accountId, previousRole); else staffRoles.delete(accountId);
+      sendJson(res, 503, { ok: false, message: "Role storage unavailable." });
+    }
     return;
   }
 
@@ -1679,9 +2048,16 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 400, { ok: false, message: "This role cannot be revoked here." });
       return;
     }
+    const previousRole = staffRoles.get(accountId);
     const removed = staffRoles.delete(accountId);
     auditSecurityEvent("role_revoked", auth.session, { account_id: accountId, removed });
-    sendJson(res, 200, { ok: true, account_id: accountId, removed });
+    try {
+      await persistCloudSaves();
+      sendJson(res, 200, { ok: true, account_id: accountId, removed });
+    } catch (error) {
+      if (previousRole) staffRoles.set(accountId, previousRole);
+      sendJson(res, 503, { ok: false, message: "Role storage unavailable." });
+    }
     return;
   }
 
@@ -1689,6 +2065,131 @@ const server = http.createServer(async (req, res) => {
     const auth = requireRequestPermission(req, res, "can_view_audit_log");
     if (!auth) return;
     sendJson(res, 200, { ok: true, entries: securityAuditLog.slice(0, 200) });
+    return;
+  }
+
+  if (url.pathname === "/admin/dashboard") {
+    const auth = requireRequestPermission(req, res, "can_access_admin_room");
+    if (!auth) return;
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Admin storage unavailable." });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      stats: {
+        online_players: knownPlayerRecords().filter((player) => player.online).length,
+        known_players: knownPlayerRecords().length,
+        active_reports: securityReports.filter((report) => report.status === "open").length,
+        active_bans: publicBanList().length,
+        suspicious_scores: securityReports.filter((report) => String(report.type || "").includes("score") || String(report.type || "").includes("run")).length,
+        current_version: LATEST_VERSION,
+        maintenance: false,
+        system_health: "ONLINE"
+      },
+      recent_actions: securityAuditLog.slice(0, 12),
+      recent_reports: securityReports.slice(0, 8)
+    });
+    return;
+  }
+
+  if (url.pathname === "/admin/players/search") {
+    const auth = requireRequestPermission(req, res, "can_view_players");
+    if (!auth) return;
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Player storage unavailable." });
+      return;
+    }
+    const query = String(url.searchParams.get("q") || "").trim().toUpperCase().slice(0, 40);
+    const players = knownPlayerRecords()
+      .filter((player) => !query || player.player_id.includes(query) || String(player.player_name || "").toUpperCase().includes(query))
+      .sort((a, b) => Number(b.online) - Number(a.online) || a.player_name.localeCompare(b.player_name))
+      .slice(0, 100);
+    sendJson(res, 200, { ok: true, players });
+    return;
+  }
+
+  if (url.pathname === "/player/profile") {
+    const auth = requireRequestPermission(req, res, "can_view_players");
+    if (!auth) return;
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Player storage unavailable." });
+      return;
+    }
+    const profile = adminPlayerProfile(url.searchParams.get("player_id"));
+    if (!profile) {
+      sendJson(res, 400, { ok: false, message: "Invalid player ID." });
+      return;
+    }
+    sendJson(res, 200, { ok: true, profile });
+    return;
+  }
+
+  const adminActions = {
+    "/admin/warn": { permission: "can_warn", action: "warn", dangerous: false },
+    "/admin/kick": { permission: "can_kick", action: "kick", dangerous: false },
+    "/admin/mute": { permission: "can_mute", action: "mute", dangerous: false },
+    "/admin/ban": { permission: "can_ban", action: "ban", dangerous: true },
+    "/admin/unban": { permission: "can_unban", action: "unban", dangerous: true },
+    "/admin/force-logout": { permission: "can_kick", action: "force_logout", dangerous: true },
+    "/admin/shadow-ban": { permission: "can_shadow_ban", action: "shadow_ban", dangerous: true },
+    "/admin/leaderboard-soft-ban": { permission: "can_manage_leaderboard", action: "leaderboard_soft_ban", dangerous: true }
+  };
+  if (req.method === "POST" && Object.prototype.hasOwnProperty.call(adminActions, url.pathname)) {
+    const config = adminActions[url.pathname];
+    const auth = requireRequestPermission(req, res, config.permission);
+    if (!auth) return;
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    const reason = String(body.reason || "").replace(/[^\w \-!?.,:]/g, "").trim().slice(0, 160);
+    if (!playerId || !reason) {
+      sendJson(res, 400, { ok: false, message: "Player ID and reason are required." });
+      return;
+    }
+    const protectedOwnerIds = [OWNER_GOOGLE_SUB ? sanitizeId(`G${OWNER_GOOGLE_SUB}`) : "", OWNER_GITHUB_ID ? sanitizeId(`H${OWNER_GITHUB_ID}`) : ""];
+    if (protectedOwnerIds.includes(playerId)) {
+      auditSecurityEvent("attempted_protected_owner_action", auth.session, { action: config.action, player_id: playerId });
+      sendJson(res, 403, { ok: false, message: "The protected owner account cannot be moderated." });
+      return;
+    }
+    if (config.dangerous && String(body.confirm || "") !== "CONFIRM") {
+      sendJson(res, 400, { ok: false, message: "Dangerous action requires CONFIRM." });
+      return;
+    }
+
+    const now = Date.now();
+    const durationSeconds = boundedInt(body.duration_seconds, 0, 315360000, 0);
+    let changed = true;
+    if (config.action === "warn") {
+      const warnings = warningsByPlayer.get(playerId) || [];
+      warnings.unshift({ reason, created_at: new Date().toISOString(), admin_id: String(auth.session.account_id || "") });
+      warningsByPlayer.set(playerId, warnings.slice(0, 50));
+    } else if (config.action === "kick") {
+      changed = disconnectPlayer(playerId, `Kick: ${reason}`);
+    } else if (config.action === "mute") {
+      mutesByPlayer.set(playerId, { reason, created_at: new Date().toISOString(), expires_at: durationSeconds > 0 ? new Date(now + durationSeconds * 1000).toISOString() : "" });
+    } else if (config.action === "ban") {
+      const record = { player_id: playerId, player_name: adminPlayerProfile(playerId)?.player_name || playerId, reason, owner_id: accountOnlineId(auth.session), created_at: new Date().toISOString(), expires_at: durationSeconds > 0 ? new Date(now + durationSeconds * 1000).toISOString() : "" };
+      bannedPlayers.set(`ID:${playerId}`, record);
+      disconnectPlayer(playerId, `Gebannt: ${reason}`);
+      invalidatePlayerSessions(playerId);
+    } else if (config.action === "unban") {
+      changed = removePlayerBan(playerId);
+    } else if (config.action === "force_logout") {
+      changed = invalidatePlayerSessions(playerId) > 0;
+      disconnectPlayer(playerId, `Abgemeldet: ${reason}`);
+    } else if (config.action === "shadow_ban") {
+      if (body.enabled === false) shadowBans.delete(playerId); else shadowBans.add(playerId);
+    } else if (config.action === "leaderboard_soft_ban") {
+      if (body.enabled === false) leaderboardSoftBans.delete(playerId); else leaderboardSoftBans.add(playerId);
+    }
+    auditSecurityEvent(`admin_${config.action}`, auth.session, { target_player_id: playerId, reason, duration_seconds: durationSeconds, changed });
+    try {
+      await persistCloudSaves();
+      sendJson(res, 200, { ok: true, action: config.action, player_id: playerId, changed, profile: adminPlayerProfile(playerId) });
+    } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Moderation storage unavailable." });
+    }
     return;
   }
 
@@ -1756,9 +2257,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === "/score-session/start" && req.method === "POST") {
+  if ((url.pathname === "/score-session/start" || url.pathname === "/run/start") && req.method === "POST") {
     cleanScoreSessions();
     const body = await readJson(req);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
     const gameVersion = String(body.game_version || "0").trim();
     if (!clientVersionOk(gameVersion)) {
       sendJson(res, 426, {
@@ -1768,36 +2271,169 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
+    if (activeBanForAuth(auth) || leaderboardSoftBans.has(auth.playerId)) {
+      recordSecurityReport("blocked_run_start", auth, { banned: Boolean(activeBanForAuth(auth)), leaderboard_soft_ban: leaderboardSoftBans.has(auth.playerId) });
+      sendJson(res, 403, { ok: false, message: "Online runs are disabled for this account." });
+      return;
+    }
+    if (body.debug_build === true || body.bot_mode === true || body.test_mode === true) {
+      recordSecurityReport("debug_or_bot_run", auth, { debug_build: body.debug_build === true, bot_mode: body.bot_mode === true, test_mode: body.test_mode === true });
+      sendJson(res, 403, { ok: false, message: "Debug, bot and test runs cannot use public leaderboards." });
+      return;
+    }
     const token = makeToken();
     scoreSessions.set(token, {
+      runId: crypto.randomUUID(),
       createdAt: Date.now(),
       lastSeenAt: Date.now(),
       gameVersion,
-      playerId: sanitizeId(body.player_id || ""),
+      playerId: auth.playerId,
+      accountId: String(auth.session && auth.session.account_id || ""),
+      state: "running",
+      progress: { score: 0, wave: 0, combo: 0, coins: 0, kills: 0, deaths: 0 },
+      progressReports: 0,
+      summary: null,
       submissions: 0,
       uploads: new Set()
     });
+    const createdSession = scoreSessions.get(token);
     sendJson(res, 201, {
       ok: true,
+      run_id: createdSession.runId,
       run_token: token,
+      run_state: createdSession.state,
       expires_in_seconds: Math.floor(SCORE_SESSION_TTL_MS / 1000)
     });
     return;
   }
 
-  if (url.pathname === "/score-session/submit" && req.method === "POST") {
+  if (url.pathname === "/run/progress" && req.method === "POST") {
     cleanScoreSessions();
     const body = await readJson(req);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
     const token = String(body.run_token || "");
     const session = scoreSessions.get(token);
-    if (!session) {
+    if (!session || session.accountId !== String(auth.session && auth.session.account_id || "")) {
+      recordSecurityReport("invalid_run_progress", auth, { reason: "missing_or_wrong_owner" });
+      sendJson(res, 401, { ok: false, message: "Secure run is missing or belongs to another account." });
+      return;
+    }
+    if (session.state !== "running") {
+      sendJson(res, 409, { ok: false, message: "Run is not running." });
+      return;
+    }
+    const next = {
+      run_score: body.run_score,
+      run_wave: body.run_wave,
+      run_combo: body.run_combo,
+      run_coins: body.run_coins
+    };
+    const validationError = runValidationError(session, next, false);
+    const score = boundedInt(body.run_score, 0, 2000000000, -1);
+    const wave = boundedInt(body.run_wave, 0, 200, -1);
+    const combo = boundedInt(body.run_combo, 0, 100000, -1);
+    const coins = boundedInt(body.run_coins, 0, 100000000, -1);
+    const kills = boundedInt(body.kills, 0, 1000000, session.progress.kills);
+    const deaths = boundedInt(body.deaths, 0, 1000000, session.progress.deaths);
+    const wentBackwards = score < session.progress.score || wave < session.progress.wave || coins < session.progress.coins || kills < session.progress.kills || deaths < session.progress.deaths;
+    if (validationError || wentBackwards) {
+      recordSecurityReport("invalid_run_progress", auth, { reason: validationError || "telemetry_went_backwards" });
+      sendJson(res, 422, { ok: false, message: validationError || "Run telemetry went backwards." });
+      return;
+    }
+    session.progress = { score, wave, combo, coins, kills, deaths };
+    session.progressReports += 1;
+    session.lastSeenAt = Date.now();
+    sendJson(res, 200, { ok: true, run_id: session.runId, run_state: session.state });
+    return;
+  }
+
+  if (url.pathname === "/run/end" && req.method === "POST") {
+    cleanScoreSessions();
+    const body = await readJson(req);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
+    const token = String(body.run_token || "");
+    const session = scoreSessions.get(token);
+    if (!session || session.accountId !== String(auth.session && auth.session.account_id || "")) {
+      recordSecurityReport("invalid_run_end", auth, { reason: "missing_or_wrong_owner" });
+      sendJson(res, 401, { ok: false, message: "Secure run is missing or belongs to another account." });
+      return;
+    }
+    if (session.state === "ended" || session.state === "submitted") {
+      sendJson(res, 200, { ok: true, run_id: session.runId, run_state: session.state, duplicate: true, summary: session.summary });
+      return;
+    }
+    if (session.state !== "running") {
+      sendJson(res, 409, { ok: false, message: "Run cannot be ended from its current state." });
+      return;
+    }
+    const validationError = runValidationError(session, body, true);
+    if (validationError) {
+      recordSecurityReport("invalid_run_end", auth, { reason: validationError });
+      sendJson(res, 422, { ok: false, message: validationError });
+      return;
+    }
+    session.summary = {
+      run_score: boundedInt(body.run_score, 0, 2000000000, 0),
+      run_wave: boundedInt(body.run_wave, 0, 200, 0),
+      run_combo: boundedInt(body.run_combo, 0, 100000, 0),
+      run_coins: boundedInt(body.run_coins, 0, 100000000, 0),
+      kills: boundedInt(body.kills, 0, 1000000, 0),
+      deaths: boundedInt(body.deaths, 0, 1000000, 0)
+    };
+    session.state = "ended";
+    session.endedAt = Date.now();
+    const profile = securityProfileFor(auth.playerId);
+    profile.coins = boundedInt(profile.coins + session.summary.run_coins, 0, 100000000, profile.coins);
+    profile.updated_at = new Date().toISOString();
+    sendJson(res, 200, { ok: true, run_id: session.runId, run_state: session.state, summary: session.summary, economy: { coins: profile.coins } });
+    return;
+  }
+
+  if (url.pathname === "/run/validate") {
+    const auth = requireRequestAuth(req, res);
+    if (!auth) return;
+    const token = String(url.searchParams.get("run_token") || "");
+    const session = scoreSessions.get(token);
+    if (!session || session.accountId !== String(auth.session && auth.session.account_id || "")) {
+      sendJson(res, 404, { ok: false, message: "Run not found." });
+      return;
+    }
+    sendJson(res, 200, { ok: true, run_id: session.runId, run_state: session.state, summary: session.summary });
+    return;
+  }
+
+  if ((url.pathname === "/score-session/submit" || url.pathname === "/leaderboard/submit") && req.method === "POST") {
+    cleanScoreSessions();
+    const body = await readJson(req);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
+    const token = String(body.run_token || "");
+    const session = scoreSessions.get(token);
+    if (!session || session.accountId !== String(auth.session && auth.session.account_id || "")) {
       sendJson(res, 401, { ok: false, message: "Secure run session is missing or expired." });
+      return;
+    }
+
+    if (activeBanForAuth(auth) || leaderboardSoftBans.has(auth.playerId)) {
+      recordSecurityReport("blocked_leaderboard_upload", auth, { run_id: session.runId });
+      sendJson(res, 403, { ok: false, message: "Leaderboard upload is disabled for this account." });
       return;
     }
 
     const error = scoreSubmissionError(session, body);
     if (error) {
+      recordSecurityReport("invalid_leaderboard_upload", auth, { run_id: session.runId, reason: error });
       sendJson(res, 422, { ok: false, message: error });
+      return;
+    }
+
+    if (shadowBans.has(auth.playerId)) {
+      session.state = "submitted";
+      session.uploads.add(`${String(body.kind || "").toLowerCase()}:${Math.floor(Number(body.wave || 0))}:${Math.floor(Number(body.score || 0))}`);
+      sendJson(res, 200, { ok: true, protected: true, shadowed: true, score: Math.floor(Number(body.score || 0)) });
       return;
     }
 
@@ -1807,6 +2443,30 @@ const server = http.createServer(async (req, res) => {
     } catch (submitError) {
       sendJson(res, 502, { ok: false, message: submitError.message || "LootLocker upload failed." });
     }
+    return;
+  }
+
+  if (url.pathname === "/leaderboard/validate-score" && req.method === "POST") {
+    const body = await readJson(req);
+    const auth = requireRequestAuth(req, res);
+    if (!auth) return;
+    const session = scoreSessions.get(String(body.run_token || ""));
+    const error = !session || session.accountId !== String(auth.session && auth.session.account_id || "")
+      ? "Run not found."
+      : scoreSubmissionError(session, body);
+    sendJson(res, error ? 422 : 200, { ok: !error, message: error, run_state: session ? session.state : "not_started" });
+    return;
+  }
+
+  if (url.pathname === "/security/report-tamper" && req.method === "POST") {
+    const body = await readJson(req);
+    const auth = requireRequestAuth(req, res);
+    if (!auth) return;
+    const report = recordSecurityReport(String(body.type || "client_tamper_report"), auth, {
+      message: String(body.message || "").slice(0, 240),
+      client_version: String(body.client_version || "").slice(0, 32)
+    });
+    sendJson(res, 201, { ok: true, report_id: report.id });
     return;
   }
 
@@ -1980,7 +2640,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    sendJson(res, 200, { ok: true, save });
+    const profile = securityProfileFor(playerId);
+    const protectedSave = { ...save, data: applySecurityProfile(save.data, profile), server_security: profile };
+    cloudSaves.set(playerId, protectedSave);
+    sendJson(res, 200, { ok: true, save: protectedSave });
     return;
   }
 
@@ -1998,17 +2661,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    const profile = securityProfileFor(playerId);
+    const transition = validateAndApplyProtectedTransition(profile, body.data);
+    if (!transition.ok) recordSecurityReport("invalid_cloud_save_values", auth, { reason: transition.reason });
+
+    const safeData = applySecurityProfile(body.data, profile);
     const save = {
       player_id: playerId,
       player_name: sanitizeName(body.player_name || playerId),
-      data: body.data,
+      data: safeData,
+      server_security: profile,
       updated_at: new Date().toISOString()
     };
 
     cloudSaves.set(playerId, save);
     try {
       await persistCloudSaves();
-      sendJson(res, 200, { ok: true, save });
+      sendJson(res, 200, { ok: true, save, protected: true, tamper_blocked: !transition.ok, message: transition.ok ? "Protected values accepted." : transition.reason });
     } catch (error) {
       sendJson(res, 503, { ok: false, message: error.message || "Cloud save could not be persisted." });
     }
@@ -2107,12 +2776,20 @@ wss.on("connection", (ws, req) => {
       }
 
       if (command === "teamwin") {
+        if (String(parts[1] || "").toUpperCase() !== "CONFIRM") {
+          send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Nutze /teamwin TEAM CONFIRM." });
+          return;
+        }
         const winnerTeam = Math.max(0, Math.min(teamCountForMode(room.mode) - 1, (Number(parts[0]) || 1) - 1));
         broadcastRoom(room, { cmd: "owner_command", command: "teamwin", team: winnerTeam });
         return;
       }
 
       if (command === "kick") {
+        if (String(parts[1] || "").toUpperCase() !== "CONFIRM" || parts.slice(2).join(" ").trim().length < 3) {
+          send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Nutze /kick SLOT CONFIRM GRUND." });
+          return;
+        }
         const targetSlot = Math.max(0, Math.min(room.maxPlayers - 1, (Number(parts[0]) || 1) - 1));
         const target = room.players[targetSlot];
         if (target && target !== ws && target.readyState === WebSocket.OPEN) {
@@ -2133,12 +2810,18 @@ wss.on("connection", (ws, req) => {
 
       if (command === "ban") {
         const targetSlot = Math.max(0, Math.min(room.maxPlayers - 1, (Number(parts.shift()) || 1) - 1));
+        const confirmation = String(parts.shift() || "").toUpperCase();
+        const reason = parts.join(" ").trim();
+        if (confirmation !== "CONFIRM" || reason.length < 3) {
+          send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Nutze /ban SLOT CONFIRM GRUND." });
+          return;
+        }
         const target = room.players[targetSlot];
         if (!target || target === ws || target.readyState !== WebSocket.OPEN) {
           send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Ban fehlgeschlagen. Nutze /players und dann /ban SLOT GRUND." });
           return;
         }
-        const record = addPlayerBan(target, parts.join(" "), ws.accountId || ws.onlineId);
+        const record = addPlayerBan(target, reason, ws.accountId || ws.onlineId);
         send(target, { cmd: "banned", message: record.reason ? `Gebannt: ${record.reason}` : "Vom Owner gebannt." });
         send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: `${record.player_name} (${record.player_id}) wurde gebannt.` });
         setTimeout(() => {
@@ -2149,6 +2832,10 @@ wss.on("connection", (ws, req) => {
 
       if (command === "unban") {
         const playerId = sanitizeId(parts[0]);
+        if (String(parts[1] || "").toUpperCase() !== "CONFIRM") {
+          send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Nutze /unban ID CONFIRM." });
+          return;
+        }
         const removed = removePlayerBan(playerId);
         send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: removed ? `${playerId} wurde entbannt.` : "Ban-ID nicht gefunden." });
         return;
@@ -2165,6 +2852,10 @@ wss.on("connection", (ws, req) => {
         const targetSlot = parts.length > 0
           ? Math.max(0, Math.min(room.maxPlayers - 1, (Number(parts[0]) || 1) - 1))
           : ws.playerId;
+        if (String(parts[1] || "").toUpperCase() !== "CONFIRM" || parts.slice(2).join(" ").trim().length < 3) {
+          send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Nutze /unlockall SLOT CONFIRM GRUND." });
+          return;
+        }
         const target = room.players[targetSlot];
         if (!target || target.readyState !== WebSocket.OPEN) {
           send(ws, { cmd: "owner_status", authorized: true, player: ws.playerId, message: "Spieler fuer /unlockall SLOT nicht gefunden." });
@@ -2185,7 +2876,7 @@ wss.on("connection", (ws, req) => {
         cmd: "owner_status",
         authorized: true,
         player: ws.playerId,
-        message: "Commands: /players, /ban SLOT GRUND, /unban ID, /banlist, /unlockall SLOT, /heal, /teamwin, /kick, /announce"
+        message: "Commands: /players, /ban SLOT CONFIRM GRUND, /unban ID CONFIRM, /banlist, /unlockall SLOT CONFIRM GRUND, /heal, /teamwin TEAM CONFIRM, /kick SLOT CONFIRM GRUND, /announce"
       });
       return;
     }
