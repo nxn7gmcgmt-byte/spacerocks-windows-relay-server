@@ -52,9 +52,16 @@ const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 const ADMIN_RECHECK_SECONDS = 300;
 const SCORE_SESSION_TTL_MS = 1000 * 60 * 60 * 6;
 const SCORE_MAX_SUBMISSIONS = 260;
+const RATE_LIMIT_WINDOW_MS = 1000 * 60;
+const RATE_LIMIT_MAX_DEFAULT = 240;
+const RATE_LIMIT_MAX_AUTH = 30;
+const RATE_LIMIT_MAX_ADMIN = 120;
+const RATE_LIMIT_MAX_SCORE = 90;
+const RATE_LIMIT_MAX_SECURITY = 35;
 
 const rooms = new Map();
 const scoreSessions = new Map();
+const rateLimitBuckets = new Map();
 const securityProfiles = new Map();
 const securityReports = [];
 const leaderboardSoftBans = new Set();
@@ -189,6 +196,29 @@ function applySecurityProfile(data, profile) {
   result.shop_ghost = boundedInt(profile.upgrades.upgrade_shield_level, 0, 5, 0) > 0;
   result.daily_reward_day = boundedInt(profile.daily.current_day, 1, 30, 1);
   return result;
+}
+
+function storeSecurityProfile(playerId, profile) {
+  const safeId = sanitizeId(playerId);
+  if (!safeId || !profile) return null;
+  const existing = cloudSaves.get(safeId) || {
+    player_id: safeId,
+    player_name: safeId,
+    account_id: "",
+    data: {}
+  };
+  const data = applySecurityProfile(existing.data || {}, profile);
+  const next = {
+    ...existing,
+    player_id: safeId,
+    player_name: sanitizeName(existing.player_name || safeId),
+    data,
+    server_security: profile,
+    updated_at: new Date().toISOString()
+  };
+  cloudSaves.set(safeId, next);
+  securityProfiles.set(safeId, profile);
+  return next;
 }
 
 function advanceDailyDay(day, steps) {
@@ -414,7 +444,11 @@ function sendJson(res, status, body) {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store"
   });
   res.end(JSON.stringify(body));
 }
@@ -573,6 +607,58 @@ function readBody(req) {
     req.on("end", () => resolve(data));
     req.on("error", () => resolve(""));
   });
+}
+
+function sendSecurityHeaders(res) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cache-Control", "no-store");
+}
+
+function requestIp(req) {
+  return String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "")
+    .split(",")[0]
+    .trim()
+    .slice(0, 96);
+}
+
+function rateLimitGroup(pathname) {
+  if (pathname.startsWith("/auth/")) return { name: "auth", max: RATE_LIMIT_MAX_AUTH };
+  if (pathname.startsWith("/admin/")) return { name: "admin", max: RATE_LIMIT_MAX_ADMIN };
+  if (pathname.startsWith("/run/") || pathname.startsWith("/score-session/") || pathname.startsWith("/leaderboard/")) return { name: "score", max: RATE_LIMIT_MAX_SCORE };
+  if (pathname.startsWith("/security/")) return { name: "security", max: RATE_LIMIT_MAX_SECURITY };
+  return { name: "default", max: RATE_LIMIT_MAX_DEFAULT };
+}
+
+function rateLimitKey(req, pathname) {
+  const authHeader = String(req.headers.authorization || "");
+  const tokenPart = authHeader.startsWith("Bearer ") ? authHeader.slice(7, 31) : "";
+  return `${rateLimitGroup(pathname).name}:${tokenPart || requestIp(req)}`;
+}
+
+function enforceRateLimit(req, res, pathname) {
+  const group = rateLimitGroup(pathname);
+  const key = rateLimitKey(req, pathname);
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(key) || { startedAt: now, count: 0 };
+  if (now - bucket.startedAt > RATE_LIMIT_WINDOW_MS) {
+    bucket.startedAt = now;
+    bucket.count = 0;
+  }
+  bucket.count += 1;
+  rateLimitBuckets.set(key, bucket);
+  if (bucket.count <= group.max) return false;
+  if (bucket.count === group.max + 1) auditSecurityEvent("rate_limit_blocked", null, { group: group.name, path: pathname, ip_hash: crypto.createHash("sha256").update(requestIp(req)).digest("hex").slice(0, 16) });
+  sendJson(res, 429, { ok: false, message: "Zu viele Anfragen. Bitte kurz warten." });
+  return true;
+}
+
+function cleanRateLimits() {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitBuckets.entries()) {
+    if (!bucket || now - bucket.startedAt > RATE_LIMIT_WINDOW_MS * 3) rateLimitBuckets.delete(key);
+  }
 }
 
 async function readJson(req) {
@@ -1124,6 +1210,35 @@ function publicBanList() {
     if (record && record.player_id) unique.set(record.player_id, record);
   }
   return Array.from(unique.values()).slice(0, 50);
+}
+
+function adminModerationItems(kind = "all") {
+  const items = [];
+  const add = (type, record = {}) => {
+    items.push({
+      type,
+      player_id: sanitizeId(record.player_id || record.target_player_id || ""),
+      player_name: sanitizeName(record.player_name || record.player_id || record.target_player_id || "SPIELER"),
+      reason: String(record.reason || record.message || "").slice(0, 180),
+      created_at: String(record.created_at || record.timestamp || ""),
+      expires_at: String(record.expires_at || ""),
+      admin_id: String(record.admin_id || record.owner_id || record.actor_account_id || "")
+    });
+  };
+  if (kind === "all" || kind === "bans") for (const record of publicBanList()) add("ban", record);
+  if (kind === "all" || kind === "warnings") {
+    for (const [playerId, entries] of warningsByPlayer.entries()) {
+      for (const entry of entries || []) add("warning", { ...entry, player_id: playerId, player_name: playerId });
+    }
+  }
+  if (kind === "all" || kind === "mutes") {
+    for (const [playerId, record] of mutesByPlayer.entries()) add("mute", { ...record, player_id: playerId, player_name: playerId });
+  }
+  if (kind === "all" || kind === "suspicious") {
+    for (const playerId of shadowBans.values()) add("shadow_ban", { player_id: playerId, player_name: playerId, reason: "Shadow-ban aktiv" });
+    for (const playerId of leaderboardSoftBans.values()) add("leaderboard_soft_ban", { player_id: playerId, player_name: playerId, reason: "Leaderboard gesperrt" });
+  }
+  return items.slice(0, 200);
 }
 
 function onlineSocketForPlayer(playerId) {
@@ -1876,11 +1991,15 @@ function liveMatches(mode = "") {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  sendSecurityHeaders(res);
+  if (Math.random() < 0.02) cleanRateLimits();
 
   if (req.method === "OPTIONS") {
     sendJson(res, 204, {});
     return;
   }
+
+  if (enforceRateLimit(req, res, url.pathname)) return;
 
   if (url.pathname === "/auth/start" || url.pathname === "/auth/login-google" || url.pathname === "/auth/login-github") {
     cleanAuthState();
@@ -2061,10 +2180,41 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === "/admin/audit/log") {
+  if (url.pathname === "/admin/audit/log" || url.pathname === "/admin/audit/list") {
     const auth = requireRequestPermission(req, res, "can_view_audit_log");
     if (!auth) return;
     sendJson(res, 200, { ok: true, entries: securityAuditLog.slice(0, 200) });
+    return;
+  }
+
+  if (url.pathname === "/admin/reports/list") {
+    const auth = requireRequestPermission(req, res, "can_view_reports");
+    if (!auth) return;
+    const status = String(url.searchParams.get("status") || "").toLowerCase();
+    const reports = securityReports
+      .filter((report) => !status || String(report.status || "open").toLowerCase() === status)
+      .slice(0, 200);
+    sendJson(res, 200, { ok: true, reports });
+    return;
+  }
+
+  if (url.pathname === "/admin/moderation/list") {
+    const auth = requireRequestPermission(req, res, "can_view_players");
+    if (!auth) return;
+    const kind = String(url.searchParams.get("kind") || "all").toLowerCase();
+    sendJson(res, 200, {
+      ok: true,
+      kind,
+      items: adminModerationItems(kind),
+      totals: {
+        bans: publicBanList().length,
+        warnings: Array.from(warningsByPlayer.values()).reduce((sum, entries) => sum + (Array.isArray(entries) ? entries.length : 0), 0),
+        mutes: mutesByPlayer.size,
+        shadow_bans: shadowBans.size,
+        leaderboard_soft_bans: leaderboardSoftBans.size,
+        reports: securityReports.length
+      }
+    });
     return;
   }
 
@@ -2189,6 +2339,85 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, action: config.action, player_id: playerId, changed, profile: adminPlayerProfile(playerId) });
     } catch (error) {
       sendJson(res, 503, { ok: false, message: "Moderation storage unavailable." });
+    }
+    return;
+  }
+
+  if ((url.pathname === "/admin/economy/grant-coins" || url.pathname === "/admin/economy/remove-coins") && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_manage_economy");
+    if (!auth) return;
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    const amount = boundedInt(body.amount, 1, 1000000, 0);
+    const reason = String(body.reason || "").replace(/[^\w \-!?.,:]/g, "").trim().slice(0, 160);
+    if (!playerId || amount <= 0 || !reason) {
+      sendJson(res, 400, { ok: false, message: "Player ID, amount and reason are required." });
+      return;
+    }
+    if (amount >= 100000 && String(body.confirm || "") !== "CONFIRM") {
+      sendJson(res, 400, { ok: false, message: "Large coin changes require CONFIRM." });
+      return;
+    }
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Economy storage unavailable." });
+      return;
+    }
+    const profile = securityProfileFor(playerId);
+    const before = profile.coins;
+    if (url.pathname.endsWith("grant-coins")) profile.coins = boundedInt(profile.coins + amount, 0, 100000000, profile.coins);
+    else profile.coins = boundedInt(profile.coins - amount, 0, 100000000, profile.coins);
+    profile.updated_at = new Date().toISOString();
+    storeSecurityProfile(playerId, profile);
+    auditSecurityEvent(url.pathname.endsWith("grant-coins") ? "admin_grant_coins" : "admin_remove_coins", auth.session, { target_player_id: playerId, amount, before, after: profile.coins, reason });
+    try {
+      await persistCloudSaves();
+      sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId), before, after: profile.coins });
+    } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Economy storage unavailable." });
+    }
+    return;
+  }
+
+  if ((url.pathname === "/admin/skins/grant" || url.pathname === "/admin/skins/remove") && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_manage_skins");
+    if (!auth) return;
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    const skinId = boundedInt(body.skin_id, 0, 9, -1);
+    const reason = String(body.reason || "").replace(/[^\w \-!?.,:]/g, "").trim().slice(0, 160);
+    if (!playerId || skinId < 0 || !reason) {
+      sendJson(res, 400, { ok: false, message: "Player ID, skin ID and reason are required." });
+      return;
+    }
+    if (skinId === 0 && url.pathname.endsWith("/remove")) {
+      sendJson(res, 400, { ok: false, message: "Default skin cannot be removed." });
+      return;
+    }
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Skin storage unavailable." });
+      return;
+    }
+    const profile = securityProfileFor(playerId);
+    const beforeMask = profile.player_skin_owned_mask;
+    if (url.pathname.endsWith("/grant")) {
+      profile.player_skin_owned_mask |= (1 << skinId);
+      if (skinId === 8) profile.rainbow_skin_unlocked = true;
+      if (skinId === 9) profile.rainbow_shots_unlocked = true;
+    } else {
+      profile.player_skin_owned_mask &= ~(1 << skinId);
+      profile.player_skin_owned_mask |= 1;
+      if (profile.player_skin_active === skinId) profile.player_skin_active = 0;
+      if (skinId === 8) profile.rainbow_skin_unlocked = false;
+      if (skinId === 9) profile.rainbow_shots_unlocked = false;
+    }
+    profile.updated_at = new Date().toISOString();
+    storeSecurityProfile(playerId, profile);
+    auditSecurityEvent(url.pathname.endsWith("/grant") ? "admin_grant_skin" : "admin_remove_skin", auth.session, { target_player_id: playerId, skin_id: skinId, before_mask: beforeMask, after_mask: profile.player_skin_owned_mask, reason });
+    try {
+      await persistCloudSaves();
+      sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId), before_mask: beforeMask, after_mask: profile.player_skin_owned_mask });
+    } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Skin storage unavailable." });
     }
     return;
   }
