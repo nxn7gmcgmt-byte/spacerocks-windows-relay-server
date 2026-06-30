@@ -80,6 +80,14 @@ const staffRoles = new Map();
 const securityAuditLog = [];
 const warningsByPlayer = new Map();
 const mutesByPlayer = new Map();
+const adminState = {
+  maintenance: { enabled: false, message: "SpaceRocks wird gerade gewartet.", updated_at: "" },
+  events: [],
+  announcements: [],
+  beta_testers: [],
+  appeals: [],
+  notes: []
+};
 const serverNews = [
   {
     title: "Geschuetzte Online-Bestenlisten",
@@ -1095,6 +1103,19 @@ async function ensureCloudSavesLoaded() {
     const safeId = sanitizeId(playerId);
     if (safeId) leaderboardSoftBans.add(safeId);
   }
+  const storedReports = parsed && Array.isArray(parsed.security_reports) ? parsed.security_reports.slice(0, 500) : [];
+  securityReports.splice(0, securityReports.length, ...storedReports.filter((entry) => entry && typeof entry === "object"));
+  const storedAdmin = parsed && parsed.admin_state && typeof parsed.admin_state === "object" ? parsed.admin_state : {};
+  if (storedAdmin.maintenance && typeof storedAdmin.maintenance === "object") {
+    adminState.maintenance = {
+      enabled: storedAdmin.maintenance.enabled === true,
+      message: String(storedAdmin.maintenance.message || "SpaceRocks wird gerade gewartet.").slice(0, 240),
+      updated_at: String(storedAdmin.maintenance.updated_at || "")
+    };
+  }
+  for (const key of ["events", "announcements", "beta_testers", "appeals", "notes"]) {
+    adminState[key] = Array.isArray(storedAdmin[key]) ? storedAdmin[key].filter((entry) => entry && typeof entry === "object").slice(0, 500) : [];
+  }
   cloudSavesLoaded = true;
 }
 
@@ -1116,7 +1137,7 @@ async function persistCloudSavesNow() {
   };
   const body = {
     message: "Update SpaceRocks account cloud saves",
-    content: Buffer.from(JSON.stringify({ version: 3, updated_at: new Date().toISOString(), saves, roles, moderation, audit: securityAuditLog.slice(0, 1000) }, null, 2)).toString("base64"),
+    content: Buffer.from(JSON.stringify({ version: 4, updated_at: new Date().toISOString(), saves, roles, moderation, security_reports: securityReports.slice(0, 500), admin_state: adminState, audit: securityAuditLog.slice(0, 1000) }, null, 2)).toString("base64"),
     branch: CLOUD_GITHUB_BRANCH
   };
   if (current.sha) body.sha = current.sha;
@@ -1236,6 +1257,8 @@ function adminModerationItems(kind = "all") {
   }
   if (kind === "all" || kind === "suspicious") {
     for (const playerId of shadowBans.values()) add("shadow_ban", { player_id: playerId, player_name: playerId, reason: "Shadow-ban aktiv" });
+  }
+  if (kind === "all" || kind === "suspicious" || kind === "leaderboard") {
     for (const playerId of leaderboardSoftBans.values()) add("leaderboard_soft_ban", { player_id: playerId, player_name: playerId, reason: "Leaderboard gesperrt" });
   }
   return items.slice(0, 200);
@@ -1304,6 +1327,31 @@ function adminPlayerProfile(playerId) {
     trust_score: Math.max(0, 100 - (warningsByPlayer.get(safeId) || []).length * 8 - (shadowBans.has(safeId) ? 40 : 0)),
     client_version: onlineSocketForPlayer(safeId) ? String(onlineSocketForPlayer(safeId).gameVersion || "online") : "offline"
   };
+}
+
+function cleanAdminText(value, maxLength = 240) {
+  return String(value || "").replace(/[<>\u0000-\u001f]/g, "").trim().slice(0, maxLength);
+}
+
+function adminRecord(kind, data, session) {
+  return {
+    id: crypto.randomUUID(),
+    type: cleanAdminText(kind, 40),
+    created_at: new Date().toISOString(),
+    created_by: String((session && session.account_id) || ""),
+    ...data
+  };
+}
+
+function findAdminRecord(collection, id) {
+  return collection.find((entry) => entry && String(entry.id || "") === String(id || "")) || null;
+}
+
+function removeAdminRecord(collection, id) {
+  const index = collection.findIndex((entry) => entry && String(entry.id || "") === String(id || ""));
+  if (index < 0) return false;
+  collection.splice(index, 1);
+  return true;
 }
 
 function disconnectPlayer(playerId, message) {
@@ -1420,6 +1468,11 @@ function allowOnlineEntry(ws, msg) {
     return false;
   }
   if (!authenticateSocket(ws, msg)) return false;
+  const authenticatedSession = authSessionForToken(msg && msg.auth_token);
+  if (adminState.maintenance.enabled && roleForSession(authenticatedSession) !== "owner") {
+    send(ws, { cmd: "maintenance", message: adminState.maintenance.message || "SpaceRocks wird gerade gewartet." });
+    return false;
+  }
   if (rejectBannedConnection(ws, msg)) return false;
   return true;
 }
@@ -2218,6 +2271,196 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/admin/reports/action" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_warn");
+    if (!auth) return;
+    const body = await readJson(req);
+    const report = securityReports.find((entry) => entry && String(entry.id || "") === String(body.report_id || ""));
+    const status = String(body.status || "resolved").toLowerCase();
+    if (!report || !["resolved", "dismissed", "open"].includes(status)) {
+      sendJson(res, 400, { ok: false, message: "Report or status is invalid." });
+      return;
+    }
+    report.status = status;
+    report.resolution = cleanAdminText(body.reason, 180);
+    report.reviewed_at = new Date().toISOString();
+    report.reviewed_by = String(auth.session.account_id || "");
+    auditSecurityEvent("admin_report_action", auth.session, { report_id: report.id, status, reason: report.resolution });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, report }); }
+    catch { sendJson(res, 503, { ok: false, message: "Report storage unavailable." }); }
+    return;
+  }
+
+  if (url.pathname === "/admin/moderation/revoke" && req.method === "POST") {
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    const kind = String(body.kind || "").toLowerCase();
+    const revokePermission = (kind === "warning" || kind === "warnings") ? "can_warn" : ((kind === "mute" || kind === "mutes") ? "can_mute" : (kind === "leaderboard_soft_ban" ? "can_manage_leaderboard" : "can_unban"));
+    const auth = requireRequestPermission(req, res, revokePermission);
+    if (!auth) return;
+    if (!playerId || !["ban", "bans", "warning", "warnings", "mute", "mutes", "shadow_ban", "leaderboard_soft_ban"].includes(kind)) {
+      sendJson(res, 400, { ok: false, message: "Moderation entry is invalid." });
+      return;
+    }
+    let changed = false;
+    if (kind === "ban" || kind === "bans") changed = removePlayerBan(playerId);
+    else if (kind === "warning" || kind === "warnings") changed = warningsByPlayer.delete(playerId);
+    else if (kind === "mute" || kind === "mutes") changed = mutesByPlayer.delete(playerId);
+    else if (kind === "shadow_ban") changed = shadowBans.delete(playerId);
+    else if (kind === "leaderboard_soft_ban") changed = leaderboardSoftBans.delete(playerId);
+    auditSecurityEvent("admin_moderation_revoke", auth.session, { target_player_id: playerId, kind, changed, reason: cleanAdminText(body.reason, 160) });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, changed }); }
+    catch { sendJson(res, 503, { ok: false, message: "Moderation storage unavailable." }); }
+    return;
+  }
+
+  const contentAdmin = {
+    events: { permission: "can_manage_events", list: adminState.events },
+    announcements: { permission: "can_send_announcements", list: adminState.announcements }
+  };
+  const contentMatch = url.pathname.match(/^\/admin\/(events|announcements)\/(list|create|action)$/);
+  if (contentMatch) {
+    const config = contentAdmin[contentMatch[1]];
+    const operation = contentMatch[2];
+    const auth = requireRequestPermission(req, res, config.permission);
+    if (!auth) return;
+    if (operation === "list") {
+      sendJson(res, 200, { ok: true, items: config.list.slice(0, 200) });
+      return;
+    }
+    if (req.method !== "POST") { sendJson(res, 405, { ok: false, message: "POST required." }); return; }
+    const body = await readJson(req);
+    if (operation === "create") {
+      const title = cleanAdminText(body.title, 80);
+      const message = cleanAdminText(body.message, 300);
+      if (!title || !message) { sendJson(res, 400, { ok: false, message: "Title and message are required." }); return; }
+      const record = adminRecord(contentMatch[1].slice(0, -1), { title, message, enabled: body.enabled !== false, starts_at: cleanAdminText(body.starts_at, 40), ends_at: cleanAdminText(body.ends_at, 40) }, auth.session);
+      config.list.unshift(record);
+      if (config.list.length > 200) config.list.length = 200;
+      auditSecurityEvent(`admin_${contentMatch[1]}_create`, auth.session, { id: record.id, title });
+      try { await persistCloudSaves(); sendJson(res, 201, { ok: true, item: record }); }
+      catch { config.list.shift(); sendJson(res, 503, { ok: false, message: "Admin content storage unavailable." }); }
+      return;
+    }
+    const record = findAdminRecord(config.list, body.id);
+    const action = String(body.action || "toggle").toLowerCase();
+    if (!record || !["toggle", "delete"].includes(action)) { sendJson(res, 400, { ok: false, message: "Item or action is invalid." }); return; }
+    if (action === "toggle") { record.enabled = !record.enabled; record.updated_at = new Date().toISOString(); }
+    else removeAdminRecord(config.list, record.id);
+    auditSecurityEvent(`admin_${contentMatch[1]}_${action}`, auth.session, { id: record.id });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, item: record }); }
+    catch { sendJson(res, 503, { ok: false, message: "Admin content storage unavailable." }); }
+    return;
+  }
+
+  if (url.pathname === "/admin/maintenance/status") {
+    const auth = requireRequestPermission(req, res, "can_manage_maintenance");
+    if (!auth) return;
+    sendJson(res, 200, { ok: true, maintenance: adminState.maintenance });
+    return;
+  }
+
+  if (url.pathname === "/admin/maintenance/set" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_manage_maintenance");
+    if (!auth) return;
+    const body = await readJson(req);
+    adminState.maintenance = { enabled: body.enabled === true, message: cleanAdminText(body.message || adminState.maintenance.message, 240), updated_at: new Date().toISOString() };
+    auditSecurityEvent("admin_maintenance_set", auth.session, adminState.maintenance);
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, maintenance: adminState.maintenance }); }
+    catch { sendJson(res, 503, { ok: false, message: "Maintenance storage unavailable." }); }
+    return;
+  }
+
+  if (url.pathname === "/admin/beta/list") {
+    const auth = requireRequestPermission(req, res, "can_manage_beta_access");
+    if (!auth) return;
+    sendJson(res, 200, { ok: true, items: adminState.beta_testers.slice(0, 200) });
+    return;
+  }
+
+  if (url.pathname === "/admin/beta/action" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_manage_beta_access");
+    if (!auth) return;
+    const body = await readJson(req);
+    const accountId = cleanAdminText(body.account_id, 160);
+    const action = String(body.action || "grant").toLowerCase();
+    if (!accountId || !["grant", "revoke"].includes(action)) { sendJson(res, 400, { ok: false, message: "Account and action are required." }); return; }
+    if (action === "grant" && !adminState.beta_testers.some((entry) => entry.account_id === accountId)) adminState.beta_testers.unshift(adminRecord("beta_tester", { account_id: accountId }, auth.session));
+    if (action === "revoke") adminState.beta_testers = adminState.beta_testers.filter((entry) => entry.account_id !== accountId);
+    auditSecurityEvent(`admin_beta_${action}`, auth.session, { account_id: accountId });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, items: adminState.beta_testers }); }
+    catch { sendJson(res, 503, { ok: false, message: "Beta storage unavailable." }); }
+    return;
+  }
+
+  if (url.pathname === "/admin/appeals/list") {
+    const auth = requireRequestPermission(req, res, "can_view_reports");
+    if (!auth) return;
+    sendJson(res, 200, { ok: true, items: adminState.appeals.slice(0, 200) });
+    return;
+  }
+
+  if (url.pathname === "/admin/appeals/action" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_ban");
+    if (!auth) return;
+    const body = await readJson(req);
+    const appeal = findAdminRecord(adminState.appeals, body.id);
+    const status = String(body.status || "resolved").toLowerCase();
+    if (!appeal || !["approved", "rejected", "open"].includes(status)) { sendJson(res, 400, { ok: false, message: "Appeal or status is invalid." }); return; }
+    appeal.status = status; appeal.resolution = cleanAdminText(body.reason, 180); appeal.reviewed_at = new Date().toISOString();
+    if (status === "approved") removePlayerBan(appeal.player_id);
+    auditSecurityEvent("admin_appeal_action", auth.session, { id: appeal.id, status, player_id: appeal.player_id });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, item: appeal }); }
+    catch { sendJson(res, 503, { ok: false, message: "Appeal storage unavailable." }); }
+    return;
+  }
+
+  if (url.pathname === "/admin/notes/list") {
+    const auth = requireRequestPermission(req, res, "can_view_players");
+    if (!auth) return;
+    sendJson(res, 200, { ok: true, items: adminState.notes.slice(0, 300) });
+    return;
+  }
+
+  if (url.pathname === "/admin/notes/action" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_warn");
+    if (!auth) return;
+    const body = await readJson(req);
+    const action = String(body.action || "create").toLowerCase();
+    if (action === "create") {
+      const message = cleanAdminText(body.message, 300);
+      if (!message) { sendJson(res, 400, { ok: false, message: "Note text is required." }); return; }
+      adminState.notes.unshift(adminRecord("admin_note", { player_id: sanitizeId(body.player_id), message }, auth.session));
+    } else if (action === "delete") {
+      if (!removeAdminRecord(adminState.notes, body.id)) { sendJson(res, 404, { ok: false, message: "Note not found." }); return; }
+    } else { sendJson(res, 400, { ok: false, message: "Invalid note action." }); return; }
+    auditSecurityEvent(`admin_note_${action}`, auth.session, { id: String(body.id || ""), player_id: sanitizeId(body.player_id) });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, items: adminState.notes.slice(0, 300) }); }
+    catch { sendJson(res, 503, { ok: false, message: "Note storage unavailable." }); }
+    return;
+  }
+
+  if (url.pathname === "/admin/settings/status") {
+    const auth = requireRequestPermission(req, res, "can_use_dangerous_tools");
+    if (!auth) return;
+    sendJson(res, 200, { ok: true, settings: { auth_required: AUTH_REQUIRED, owner_auth_configured: ownerIdentityConfigured(), cloud_persistence: Boolean(GITHUB_TOKEN), rate_limit_buckets: rateLimitBuckets.size, auth_sessions: authSessions.size, score_sessions: scoreSessions.size, maintenance: adminState.maintenance, latest_version: LATEST_VERSION, min_client_version: MIN_CLIENT_VERSION } });
+    return;
+  }
+
+  if (url.pathname === "/admin/settings/action" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_use_dangerous_tools");
+    if (!auth) return;
+    const body = await readJson(req);
+    const action = String(body.action || "").toLowerCase();
+    if (String(body.confirm || "") !== "CONFIRM" || !["persist", "clear_rate_limits", "cleanup_sessions"].includes(action)) { sendJson(res, 400, { ok: false, message: "Valid action and CONFIRM are required." }); return; }
+    if (action === "clear_rate_limits") rateLimitBuckets.clear();
+    if (action === "cleanup_sessions") cleanAuthState();
+    auditSecurityEvent(`admin_settings_${action}`, auth.session, {});
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, action }); }
+    catch { sendJson(res, 503, { ok: false, message: "Admin storage unavailable." }); }
+    return;
+  }
+
   if (url.pathname === "/admin/dashboard") {
     const auth = requireRequestPermission(req, res, "can_access_admin_room");
     if (!auth) return;
@@ -2234,8 +2477,12 @@ const server = http.createServer(async (req, res) => {
         active_bans: publicBanList().length,
         suspicious_scores: securityReports.filter((report) => String(report.type || "").includes("score") || String(report.type || "").includes("run")).length,
         current_version: LATEST_VERSION,
-        maintenance: false,
-        system_health: "ONLINE"
+        maintenance: adminState.maintenance.enabled,
+        system_health: adminState.maintenance.enabled ? "MAINTENANCE" : "ONLINE",
+        active_events: adminState.events.filter((entry) => entry.enabled).length,
+        active_announcements: adminState.announcements.filter((entry) => entry.enabled).length,
+        beta_testers: adminState.beta_testers.length,
+        open_appeals: adminState.appeals.filter((entry) => entry.status === "open").length
       },
       recent_actions: securityAuditLog.slice(0, 12),
       recent_reports: securityReports.slice(0, 8)
@@ -2422,6 +2669,67 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/admin/skins/bulk" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_manage_skins");
+    if (!auth) return;
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    const action = String(body.action || "grant_all").toLowerCase();
+    const reason = cleanAdminText(body.reason, 160);
+    if (!playerId || !reason || !["grant_all", "remove_all"].includes(action) || (action === "remove_all" && String(body.confirm || "") !== "CONFIRM")) {
+      sendJson(res, 400, { ok: false, message: "Player, reason and valid confirmed action are required." });
+      return;
+    }
+    try { await ensureCloudSavesLoaded(); } catch { sendJson(res, 503, { ok: false, message: "Skin storage unavailable." }); return; }
+    const profile = securityProfileFor(playerId);
+    const beforeMask = profile.player_skin_owned_mask;
+    profile.player_skin_owned_mask = action === "grant_all" ? 1023 : 1;
+    profile.player_skin_active = action === "remove_all" ? 0 : profile.player_skin_active;
+    profile.rainbow_skin_unlocked = action === "grant_all";
+    profile.rainbow_shots_unlocked = action === "grant_all";
+    profile.updated_at = new Date().toISOString();
+    storeSecurityProfile(playerId, profile);
+    auditSecurityEvent(`admin_skins_${action}`, auth.session, { target_player_id: playerId, before_mask: beforeMask, after_mask: profile.player_skin_owned_mask, reason });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId) }); }
+    catch { sendJson(res, 503, { ok: false, message: "Skin storage unavailable." }); }
+    return;
+  }
+
+  if (url.pathname === "/admin/skins/equip" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_manage_skins");
+    if (!auth) return;
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    const skinId = boundedInt(body.skin_id, 0, 8, -1);
+    const profile = playerId ? securityProfileFor(playerId) : null;
+    if (!profile || skinId < 0 || (profile.player_skin_owned_mask & (1 << skinId)) === 0) { sendJson(res, 400, { ok: false, message: "Skin is not owned or input is invalid." }); return; }
+    profile.player_skin_active = skinId;
+    profile.updated_at = new Date().toISOString();
+    storeSecurityProfile(playerId, profile);
+    auditSecurityEvent("admin_skin_equip", auth.session, { target_player_id: playerId, skin_id: skinId, reason: cleanAdminText(body.reason, 160) });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId) }); }
+    catch { sendJson(res, 503, { ok: false, message: "Skin storage unavailable." }); }
+    return;
+  }
+
+  if (url.pathname === "/admin/economy/reset-progress" && req.method === "POST") {
+    const auth = requireRequestPermission(req, res, "can_reset_progress");
+    if (!auth) return;
+    const body = await readJson(req);
+    const playerId = sanitizeId(body.player_id);
+    const reason = cleanAdminText(body.reason, 160);
+    if (!playerId || !reason || String(body.confirm || "") !== "CONFIRM") { sendJson(res, 400, { ok: false, message: "Reset requires player, reason and CONFIRM." }); return; }
+    const previous = securityProfileFor(playerId);
+    const reset = defaultSecurityProfile(playerId);
+    storeSecurityProfile(playerId, reset);
+    const save = cloudSaves.get(playerId);
+    if (save) { save.data = applySecurityProfile({}, reset); save.server_security = reset; save.updated_at = new Date().toISOString(); }
+    auditSecurityEvent("admin_reset_progress", auth.session, { target_player_id: playerId, reason, previous_coins: previous.coins });
+    try { await persistCloudSaves(); sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId) }); }
+    catch { storeSecurityProfile(playerId, previous); sendJson(res, 503, { ok: false, message: "Progress storage unavailable." }); }
+    return;
+  }
+
   if (url.pathname === "/version/check") {
     const gameVersion = String(url.searchParams.get("game_version") || "0").trim();
     const updateRequired = compareVersion(gameVersion, MIN_CLIENT_VERSION) < 0;
@@ -2481,7 +2789,8 @@ const server = http.createServer(async (req, res) => {
       active_spectators: Array.from(rooms.values()).reduce((sum, room) => sum + roomSpectators(room).length, 0),
       banned_players: publicBanList().length,
       protected_score_sessions: scoreSessions.size,
-      uptime_seconds: Math.floor(process.uptime())
+      uptime_seconds: Math.floor(process.uptime()),
+      maintenance: adminState.maintenance
     });
     return;
   }
@@ -2777,7 +3086,13 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/news") {
     sendJson(res, 200, {
       ok: true,
-      news: serverNews.slice(0, 10)
+      news: adminState.announcements
+        .filter((entry) => entry.enabled)
+        .map((entry) => ({ title: entry.title, text: entry.message, created_at: entry.created_at }))
+        .concat(serverNews)
+        .slice(0, 10),
+      events: adminState.events.filter((entry) => entry.enabled).slice(0, 20),
+      maintenance: adminState.maintenance
     });
     return;
   }
@@ -2910,6 +3225,21 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       sendJson(res, 503, { ok: false, message: error.message || "Cloud save could not be persisted." });
     }
+    return;
+  }
+
+  if (url.pathname === "/appeals/submit" && req.method === "POST") {
+    const body = await readJson(req);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
+    const message = cleanAdminText(body.message, 500);
+    if (message.length < 10) { sendJson(res, 400, { ok: false, message: "Appeal must contain at least 10 characters." }); return; }
+    if (adminState.appeals.some((entry) => entry.player_id === auth.playerId && entry.status === "open")) { sendJson(res, 409, { ok: false, message: "An open appeal already exists." }); return; }
+    const appeal = adminRecord("appeal", { player_id: auth.playerId, player_name: sanitizeName(auth.session && auth.session.name), message, status: "open" }, auth.session);
+    adminState.appeals.unshift(appeal);
+    auditSecurityEvent("appeal_submitted", auth.session, { id: appeal.id });
+    try { await persistCloudSaves(); sendJson(res, 201, { ok: true, appeal_id: appeal.id }); }
+    catch { adminState.appeals.shift(); sendJson(res, 503, { ok: false, message: "Appeal storage unavailable." }); }
     return;
   }
 
