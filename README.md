@@ -75,6 +75,12 @@ SPACEROCKS_STEAM_LOGIN_ENABLED=false
 SPACEROCKS_STEAM_WEB_API_KEY=OPTIONALER_STEAM_WEB_API_KEY
 SPACEROCKS_ROBLOX_CLIENT_ID=ROBLOX_OAUTH_CLIENT_ID
 SPACEROCKS_ROBLOX_CLIENT_SECRET=ROBLOX_OAUTH_CLIENT_SECRET
+SPACEROCKS_DISCORD_CLIENT_ID=DISCORD_OAUTH_CLIENT_ID
+SPACEROCKS_DISCORD_CLIENT_SECRET=DISCORD_OAUTH_CLIENT_SECRET
+SPACEROCKS_MICROSOFT_CLIENT_ID=MICROSOFT_OAUTH_CLIENT_ID
+SPACEROCKS_MICROSOFT_CLIENT_SECRET=MICROSOFT_OAUTH_CLIENT_SECRET
+SPACEROCKS_TWITCH_CLIENT_ID=TWITCH_OAUTH_CLIENT_ID
+SPACEROCKS_TWITCH_CLIENT_SECRET=TWITCH_OAUTH_CLIENT_SECRET
 ```
 
 Wenn `MIN_CLIENT_VERSION` hoeher ist als die Spielversion, blockt der Server den alten Client.
@@ -105,6 +111,16 @@ Roblox Redirect URI:
 ```text
 https://spacerocks-windows-relay.onrender.com/auth/callback/roblox
 ```
+
+Discord, Microsoft/Xbox und Twitch verwenden entsprechend diese Redirect URIs:
+
+```text
+https://spacerocks-windows-relay.onrender.com/auth/callback/discord
+https://spacerocks-windows-relay.onrender.com/auth/callback/microsoft
+https://spacerocks-windows-relay.onrender.com/auth/callback/twitch
+```
+
+Opera/GX.games und Itch.io bleiben sichere Platzhalter, bis ein genehmigter Authorization-Code-Flow oder eine eigene OAuth-Bridge verfuegbar ist. Dafuer sind `SPACEROCKS_OPERA_GX_*` und `SPACEROCKS_ITCHIO_*` mit `CLIENT_ID`, `CLIENT_SECRET`, `AUTH_URL`, `TOKEN_URL` und `USERINFO_URL` vorbereitet. Ohne vollstaendige Konfiguration antwortet der Server mit HTTP 503 und erstellt keine Sitzung.
 
 Epic Games, PlayStation und Nintendo sind im Server vorbereitet, bleiben aber unsichtbar, bis die genehmigten Anbieter-Zugangsdaten und alle drei OAuth-Endpunkte als Render-Variablen gesetzt sind. Die Variablennamen lauten jeweils `SPACEROCKS_<ANBIETER>_CLIENT_ID`, `..._CLIENT_SECRET`, `..._AUTH_URL`, `..._TOKEN_URL` und `..._USERINFO_URL`.
 
