@@ -60,6 +60,22 @@ const NINTENDO_CLIENT_SECRET = process.env.SPACEROCKS_NINTENDO_CLIENT_SECRET || 
 const NINTENDO_AUTH_URL = process.env.SPACEROCKS_NINTENDO_AUTH_URL || "";
 const NINTENDO_TOKEN_URL = process.env.SPACEROCKS_NINTENDO_TOKEN_URL || "";
 const NINTENDO_USERINFO_URL = process.env.SPACEROCKS_NINTENDO_USERINFO_URL || "";
+const DISCORD_CLIENT_ID = process.env.SPACEROCKS_DISCORD_CLIENT_ID || "";
+const DISCORD_CLIENT_SECRET = process.env.SPACEROCKS_DISCORD_CLIENT_SECRET || "";
+const MICROSOFT_CLIENT_ID = process.env.SPACEROCKS_MICROSOFT_CLIENT_ID || "";
+const MICROSOFT_CLIENT_SECRET = process.env.SPACEROCKS_MICROSOFT_CLIENT_SECRET || "";
+const TWITCH_CLIENT_ID = process.env.SPACEROCKS_TWITCH_CLIENT_ID || "";
+const TWITCH_CLIENT_SECRET = process.env.SPACEROCKS_TWITCH_CLIENT_SECRET || "";
+const OPERA_GX_CLIENT_ID = process.env.SPACEROCKS_OPERA_GX_CLIENT_ID || "";
+const OPERA_GX_CLIENT_SECRET = process.env.SPACEROCKS_OPERA_GX_CLIENT_SECRET || "";
+const OPERA_GX_AUTH_URL = process.env.SPACEROCKS_OPERA_GX_AUTH_URL || "";
+const OPERA_GX_TOKEN_URL = process.env.SPACEROCKS_OPERA_GX_TOKEN_URL || "";
+const OPERA_GX_USERINFO_URL = process.env.SPACEROCKS_OPERA_GX_USERINFO_URL || "";
+const ITCHIO_CLIENT_ID = process.env.SPACEROCKS_ITCHIO_CLIENT_ID || "";
+const ITCHIO_CLIENT_SECRET = process.env.SPACEROCKS_ITCHIO_CLIENT_SECRET || "";
+const ITCHIO_AUTH_URL = process.env.SPACEROCKS_ITCHIO_AUTH_URL || "";
+const ITCHIO_TOKEN_URL = process.env.SPACEROCKS_ITCHIO_TOKEN_URL || "";
+const ITCHIO_USERINFO_URL = process.env.SPACEROCKS_ITCHIO_USERINFO_URL || "";
 const APPLE_CLIENT_ID = process.env.SPACEROCKS_APPLE_CLIENT_ID || "";
 const APPLE_TEAM_ID = process.env.SPACEROCKS_APPLE_TEAM_ID || "";
 const APPLE_KEY_ID = process.env.SPACEROCKS_APPLE_KEY_ID || "";
@@ -970,6 +986,26 @@ function nintendoAuthConfigured() {
   return customOAuthConfigured(NINTENDO_CLIENT_ID, NINTENDO_CLIENT_SECRET, NINTENDO_AUTH_URL, NINTENDO_TOKEN_URL, NINTENDO_USERINFO_URL);
 }
 
+function discordAuthConfigured() {
+  return Boolean(DISCORD_CLIENT_ID && DISCORD_CLIENT_SECRET);
+}
+
+function microsoftAuthConfigured() {
+  return Boolean(MICROSOFT_CLIENT_ID && MICROSOFT_CLIENT_SECRET);
+}
+
+function twitchAuthConfigured() {
+  return Boolean(TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET);
+}
+
+function operaGxAuthConfigured() {
+  return customOAuthConfigured(OPERA_GX_CLIENT_ID, OPERA_GX_CLIENT_SECRET, OPERA_GX_AUTH_URL, OPERA_GX_TOKEN_URL, OPERA_GX_USERINFO_URL);
+}
+
+function itchioAuthConfigured() {
+  return customOAuthConfigured(ITCHIO_CLIENT_ID, ITCHIO_CLIENT_SECRET, ITCHIO_AUTH_URL, ITCHIO_TOKEN_URL, ITCHIO_USERINFO_URL);
+}
+
 function authProviderConfigured(provider) {
   const checks = {
     google: googleAuthConfigured,
@@ -979,7 +1015,12 @@ function authProviderConfigured(provider) {
     roblox: robloxAuthConfigured,
     epic: epicAuthConfigured,
     playstation: playstationAuthConfigured,
-    nintendo: nintendoAuthConfigured
+    nintendo: nintendoAuthConfigured,
+    discord: discordAuthConfigured,
+    microsoft: microsoftAuthConfigured,
+    twitch: twitchAuthConfigured,
+    opera_gx: operaGxAuthConfigured,
+    itchio: itchioAuthConfigured
   };
   return Object.prototype.hasOwnProperty.call(checks, provider) && checks[provider]();
 }
@@ -1217,9 +1258,10 @@ async function exchangeGenericOAuthCode(provider, code, redirectUri, config) {
   const tokenData = await tokenResponse.json().catch(() => ({}));
   if (!tokenResponse.ok || !tokenData.access_token) throw new Error(`${provider} token exchange failed.`);
   const profileResponse = await fetch(config.userInfoUrl, {
-    headers: { "Authorization": `Bearer ${tokenData.access_token}`, "Accept": "application/json" }
+    headers: { "Authorization": `Bearer ${tokenData.access_token}`, "Accept": "application/json", ...(config.extraHeaders || {}) }
   });
-  const profile = await profileResponse.json().catch(() => ({}));
+  const rawProfile = await profileResponse.json().catch(() => ({}));
+  const profile = Array.isArray(rawProfile.data) ? (rawProfile.data[0] || {}) : rawProfile;
   const providerId = String(profile.sub || profile.id || profile.account_id || profile.accountId || profile.user_id || "");
   if (!profileResponse.ok || !providerId) throw new Error(`${provider} identity verification failed.`);
   return {
@@ -1227,7 +1269,7 @@ async function exchangeGenericOAuthCode(provider, code, redirectUri, config) {
     provider_id: providerId,
     account_id: `${provider}:${providerId}`,
     email: String(profile.email || "").toLowerCase(),
-    name: sanitizeName(profile.name || profile.display_name || profile.displayName || profile.preferred_username || profile.username || `${provider.toUpperCase()} SPIELER`)
+    name: sanitizeName(profile.name || profile.global_name || profile.display_name || profile.displayName || profile.preferred_username || profile.username || profile.login || `${provider.toUpperCase()} SPIELER`)
   };
 }
 
@@ -1236,6 +1278,11 @@ function genericOAuthConfig(provider) {
   if (provider === "epic") return { clientId: EPIC_CLIENT_ID, clientSecret: EPIC_CLIENT_SECRET, authUrl: EPIC_AUTH_URL, tokenUrl: EPIC_TOKEN_URL, userInfoUrl: EPIC_USERINFO_URL, scope: "basic_profile" };
   if (provider === "playstation") return { clientId: PLAYSTATION_CLIENT_ID, clientSecret: PLAYSTATION_CLIENT_SECRET, authUrl: PLAYSTATION_AUTH_URL, tokenUrl: PLAYSTATION_TOKEN_URL, userInfoUrl: PLAYSTATION_USERINFO_URL, scope: "openid profile" };
   if (provider === "nintendo") return { clientId: NINTENDO_CLIENT_ID, clientSecret: NINTENDO_CLIENT_SECRET, authUrl: NINTENDO_AUTH_URL, tokenUrl: NINTENDO_TOKEN_URL, userInfoUrl: NINTENDO_USERINFO_URL, scope: "openid profile" };
+  if (provider === "discord") return { clientId: DISCORD_CLIENT_ID, clientSecret: DISCORD_CLIENT_SECRET, authUrl: "https://discord.com/oauth2/authorize", tokenUrl: "https://discord.com/api/oauth2/token", userInfoUrl: "https://discord.com/api/users/@me", scope: "identify email" };
+  if (provider === "microsoft") return { clientId: MICROSOFT_CLIENT_ID, clientSecret: MICROSOFT_CLIENT_SECRET, authUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize", tokenUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/token", userInfoUrl: "https://graph.microsoft.com/oidc/userinfo", scope: "openid profile email" };
+  if (provider === "twitch") return { clientId: TWITCH_CLIENT_ID, clientSecret: TWITCH_CLIENT_SECRET, authUrl: "https://id.twitch.tv/oauth2/authorize", tokenUrl: "https://id.twitch.tv/oauth2/token", userInfoUrl: "https://api.twitch.tv/helix/users", scope: "user:read:email", extraHeaders: { "Client-Id": TWITCH_CLIENT_ID } };
+  if (provider === "opera_gx") return { clientId: OPERA_GX_CLIENT_ID, clientSecret: OPERA_GX_CLIENT_SECRET, authUrl: OPERA_GX_AUTH_URL, tokenUrl: OPERA_GX_TOKEN_URL, userInfoUrl: OPERA_GX_USERINFO_URL, scope: "openid profile email" };
+  if (provider === "itchio") return { clientId: ITCHIO_CLIENT_ID, clientSecret: ITCHIO_CLIENT_SECRET, authUrl: ITCHIO_AUTH_URL, tokenUrl: ITCHIO_TOKEN_URL, userInfoUrl: ITCHIO_USERINFO_URL, scope: "profile:me" };
   return null;
 }
 
@@ -2411,7 +2458,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (/^\/auth\/callback\/(google|apple|github|steam|roblox|epic|playstation|nintendo)$/.test(url.pathname)) {
+  if (/^\/auth\/callback\/(google|apple|github|steam|roblox|epic|playstation|nintendo|discord|microsoft|twitch|opera_gx|itchio)$/.test(url.pathname)) {
     cleanAuthState();
     let callbackParams = url.searchParams;
     if (req.method === "POST") callbackParams = new URLSearchParams(await readBody(req));
@@ -3107,6 +3154,11 @@ const server = http.createServer(async (req, res) => {
       epic_auth_configured: epicAuthConfigured(),
       playstation_auth_configured: playstationAuthConfigured(),
       nintendo_auth_configured: nintendoAuthConfigured(),
+      discord_auth_configured: discordAuthConfigured(),
+      microsoft_auth_configured: microsoftAuthConfigured(),
+      twitch_auth_configured: twitchAuthConfigured(),
+      opera_gx_auth_configured: operaGxAuthConfigured(),
+      itchio_auth_configured: itchioAuthConfigured(),
       cloud_persistence_configured: Boolean(GITHUB_TOKEN && CLOUD_GITHUB_REPO && CLOUD_GITHUB_BRANCH),
       live_matches: liveMatches().length,
       active_spectators: Array.from(rooms.values()).reduce((sum, room) => sum + roomSpectators(room).length, 0),
