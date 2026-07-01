@@ -1,4 +1,1 @@
-{
-  "version": 1,
-  "saves": {}
-}
+{"version":6,"updated_at":"2026-07-01T11:46:36.633Z","saves":{},"roles":{},"moderation":{"bans":[],"warnings":{},"mutes":{},"shadow_bans":[],"leaderboard_soft_bans":[]},"security_reports":[],"admin_state":{"maintenance":{"enabled":false,"message":"SpaceRocks wird gerade gewartet.","updated_at":""},"events":[],"announcements":[],"beta_testers":[],"appeals":[],"notes":[]},"audit":[{"id":"82b451be-0e6c-450e-addf-826f31306833","type":"admin_settings_compact_storage","actor_account_id":"google:115125626234842746312","actor_provider":"google","actor_role":"owner","timestamp":"2026-07-01T11:46:36.285Z","details":{}},{"id":"f07b01ae-1cbd-4d50-9c9d-6c58e1bc8902","type":"admin_permission_check_success","actor_account_id":"google:115125626234842746312","actor_provider":"google","actor_role":"owner","timestamp":"2026-07-01T11:46:36.284Z","details":{"permission":"can_use_dangerous_tools"}}]}
