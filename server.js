@@ -1420,11 +1420,16 @@ function persistCloudSaves() {
 
 function sendStorageError(res, error, area = "Cloud") {
   const full = error && error.code === "STORAGE_LIMIT";
-  console.error(`[STORAGE] ${area}:`, error && error.message ? error.message : error);
-  sendJson(res, full ? 507 : 503, {
+  const rawMessage = String(error && error.message ? error.message : error || "");
+  const upstreamMatch = rawMessage.match(/HTTP\s+(\d{3})/i);
+  const upstreamStatus = upstreamMatch ? Number(upstreamMatch[1]) : 0;
+  const denied = upstreamStatus === 401 || upstreamStatus === 403;
+  console.error(`[STORAGE] ${area}:`, rawMessage);
+  sendJson(res, full ? 507 : denied ? 502 : 503, {
     ok: false,
-    error_code: full ? "storage_full" : "storage_unavailable",
-    message: full ? "Cloud storage is full. Run STORAGE KOMPAKT in Admin Settings." : `${area} storage is temporarily unavailable.`
+    error_code: full ? "storage_full" : denied ? "storage_permission_denied" : "storage_unavailable",
+    upstream_status: upstreamStatus,
+    message: full ? "Cloud storage is full. Run STORAGE KOMPAKT in Admin Settings." : denied ? "Cloud storage token has no write permission." : `${area} storage is temporarily unavailable.`
   });
 }
 
