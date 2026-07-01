@@ -69,12 +69,18 @@ SPACEROCKS_APPLE_CLIENT_ID=APPLE_SERVICES_ID
 SPACEROCKS_APPLE_TEAM_ID=APPLE_TEAM_ID
 SPACEROCKS_APPLE_KEY_ID=APPLE_SIGN_IN_KEY_ID
 SPACEROCKS_APPLE_PRIVATE_KEY=APPLE_P8_PRIVATE_KEY
+SPACEROCKS_GITHUB_OAUTH_CLIENT_ID=GITHUB_OAUTH_CLIENT_ID
+SPACEROCKS_GITHUB_OAUTH_CLIENT_SECRET=GITHUB_OAUTH_CLIENT_SECRET
+SPACEROCKS_STEAM_LOGIN_ENABLED=false
+SPACEROCKS_STEAM_WEB_API_KEY=OPTIONALER_STEAM_WEB_API_KEY
+SPACEROCKS_ROBLOX_CLIENT_ID=ROBLOX_OAUTH_CLIENT_ID
+SPACEROCKS_ROBLOX_CLIENT_SECRET=ROBLOX_OAUTH_CLIENT_SECRET
 ```
 
 Wenn `MIN_CLIENT_VERSION` hoeher ist als die Spielversion, blockt der Server den alten Client.
 Wenn das GitHub-Repo privat ist, braucht Render `SPACEROCKS_GITHUB_TOKEN`, damit `/launcher-release` und `/download/...` die privaten Release-ZIPs lesen koennen.
 
-`SPACEROCKS_AUTH_REQUIRED` erst auf `true` setzen, nachdem mindestens Google oder Apple komplett konfiguriert wurde. Sonst kann sich niemand anmelden.
+`SPACEROCKS_AUTH_REQUIRED` erst auf `true` setzen, nachdem mindestens ein Anbieter komplett konfiguriert wurde. Der Client zeigt nur Anbieter an, die der `/health`-Endpunkt als bereit meldet.
 
 Google Redirect URI:
 
@@ -87,6 +93,20 @@ Apple Return URL:
 ```text
 https://spacerocks-windows-relay.onrender.com/auth/callback/apple
 ```
+
+Steam Return URL:
+
+```text
+https://spacerocks-windows-relay.onrender.com/auth/callback/steam
+```
+
+Roblox Redirect URI:
+
+```text
+https://spacerocks-windows-relay.onrender.com/auth/callback/roblox
+```
+
+Epic Games, PlayStation und Nintendo sind im Server vorbereitet, bleiben aber unsichtbar, bis die genehmigten Anbieter-Zugangsdaten und alle drei OAuth-Endpunkte als Render-Variablen gesetzt sind. Die Variablennamen lauten jeweils `SPACEROCKS_<ANBIETER>_CLIENT_ID`, `..._CLIENT_SECRET`, `..._AUTH_URL`, `..._TOKEN_URL` und `..._USERINFO_URL`.
 
 `SPACEROCKS_OWNER_SECRET` und alle OAuth-Secrets bleiben ausschliesslich als geheime Render-Variablen. Der Client speichert weder Secrets noch Login-Tokens in Saves, INI-Dateien oder Optionen. `SPACEROCKS_OWNER_ACCOUNT` bindet den Owner-Rang zusaetzlich an genau ein Google-/Apple-Konto. Im Match oeffnet F12 den Owner-Login. Nach erfolgreicher Serverpruefung stehen unter anderem `/players`, `/ban SLOT GRUND`, `/unban ID`, `/banlist`, `/unlockall SLOT`, `/heal`, `/teamwin 1`, `/kick 2` und `/announce TEXT` zur Verfuegung.
 

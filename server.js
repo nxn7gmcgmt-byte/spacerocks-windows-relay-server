@@ -41,6 +41,25 @@ const GOOGLE_CLIENT_ID = process.env.SPACEROCKS_GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.SPACEROCKS_GOOGLE_CLIENT_SECRET || "";
 const GITHUB_OAUTH_CLIENT_ID = process.env.SPACEROCKS_GITHUB_OAUTH_CLIENT_ID || "";
 const GITHUB_OAUTH_CLIENT_SECRET = process.env.SPACEROCKS_GITHUB_OAUTH_CLIENT_SECRET || "";
+const STEAM_LOGIN_ENABLED = process.env.SPACEROCKS_STEAM_LOGIN_ENABLED === "true";
+const STEAM_WEB_API_KEY = process.env.SPACEROCKS_STEAM_WEB_API_KEY || "";
+const ROBLOX_CLIENT_ID = process.env.SPACEROCKS_ROBLOX_CLIENT_ID || "";
+const ROBLOX_CLIENT_SECRET = process.env.SPACEROCKS_ROBLOX_CLIENT_SECRET || "";
+const EPIC_CLIENT_ID = process.env.SPACEROCKS_EPIC_CLIENT_ID || "";
+const EPIC_CLIENT_SECRET = process.env.SPACEROCKS_EPIC_CLIENT_SECRET || "";
+const EPIC_AUTH_URL = process.env.SPACEROCKS_EPIC_AUTH_URL || "";
+const EPIC_TOKEN_URL = process.env.SPACEROCKS_EPIC_TOKEN_URL || "";
+const EPIC_USERINFO_URL = process.env.SPACEROCKS_EPIC_USERINFO_URL || "";
+const PLAYSTATION_CLIENT_ID = process.env.SPACEROCKS_PLAYSTATION_CLIENT_ID || "";
+const PLAYSTATION_CLIENT_SECRET = process.env.SPACEROCKS_PLAYSTATION_CLIENT_SECRET || "";
+const PLAYSTATION_AUTH_URL = process.env.SPACEROCKS_PLAYSTATION_AUTH_URL || "";
+const PLAYSTATION_TOKEN_URL = process.env.SPACEROCKS_PLAYSTATION_TOKEN_URL || "";
+const PLAYSTATION_USERINFO_URL = process.env.SPACEROCKS_PLAYSTATION_USERINFO_URL || "";
+const NINTENDO_CLIENT_ID = process.env.SPACEROCKS_NINTENDO_CLIENT_ID || "";
+const NINTENDO_CLIENT_SECRET = process.env.SPACEROCKS_NINTENDO_CLIENT_SECRET || "";
+const NINTENDO_AUTH_URL = process.env.SPACEROCKS_NINTENDO_AUTH_URL || "";
+const NINTENDO_TOKEN_URL = process.env.SPACEROCKS_NINTENDO_TOKEN_URL || "";
+const NINTENDO_USERINFO_URL = process.env.SPACEROCKS_NINTENDO_USERINFO_URL || "";
 const APPLE_CLIENT_ID = process.env.SPACEROCKS_APPLE_CLIENT_ID || "";
 const APPLE_TEAM_ID = process.env.SPACEROCKS_APPLE_TEAM_ID || "";
 const APPLE_KEY_ID = process.env.SPACEROCKS_APPLE_KEY_ID || "";
@@ -62,6 +81,12 @@ const RATE_LIMIT_MAX_AUTH = 30;
 const RATE_LIMIT_MAX_ADMIN = 120;
 const RATE_LIMIT_MAX_SCORE = 90;
 const RATE_LIMIT_MAX_SECURITY = 35;
+const MAX_CLOUD_SAVE_BYTES = 48 * 1024;
+const MAX_STORAGE_FILE_BYTES = 80 * 1024 * 1024;
+const MAX_CLOUD_DATA_KEYS = 180;
+const MAX_AUDIT_ENTRIES = 300;
+const MAX_SECURITY_REPORTS = 150;
+const ADMIN_COLLECTION_LIMITS = Object.freeze({ events: 40, announcements: 40, beta_testers: 200, appeals: 120, notes: 180 });
 
 const rooms = new Map();
 const scoreSessions = new Map();
@@ -187,6 +212,48 @@ function migrateSecurityProfile(playerId, save) {
   return profile;
 }
 
+function compactCloudData(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return {};
+  const compact = {};
+  let count = 0;
+  for (const [rawKey, rawValue] of Object.entries(data)) {
+    if (count >= MAX_CLOUD_DATA_KEYS) break;
+    const key = String(rawKey || "").replace(/[^a-zA-Z0-9_]/g, "").slice(0, 64);
+    if (!key || Object.prototype.hasOwnProperty.call(compact, key)) continue;
+
+    if (typeof rawValue === "boolean" || typeof rawValue === "number") {
+      compact[key] = rawValue;
+    } else if (typeof rawValue === "string") {
+      compact[key] = rawValue.slice(0, 240);
+    } else if (Array.isArray(rawValue)) {
+      compact[key] = rawValue.slice(0, 256).map((value) => {
+        if (typeof value === "boolean" || typeof value === "number") return value;
+        if (typeof value === "string") return value.slice(0, 80);
+        return null;
+      });
+    } else {
+      continue;
+    }
+    count += 1;
+  }
+  return compact;
+}
+
+function normalizeCloudSaveRecord(playerId, rawSave) {
+  const safeId = sanitizeId(playerId || (rawSave && rawSave.player_id));
+  if (!safeId) return null;
+  const source = rawSave && typeof rawSave === "object" ? rawSave : {};
+  const profile = migrateSecurityProfile(safeId, source);
+  return {
+    player_id: safeId,
+    player_name: sanitizeName(source.player_name || safeId),
+    account_id: String(source.account_id || "").slice(0, 160),
+    data: applySecurityProfile(compactCloudData(source.data), profile),
+    server_security: profile,
+    updated_at: String(source.updated_at || new Date().toISOString()).slice(0, 40)
+  };
+}
+
 function securityProfileFor(playerId) {
   const safeId = sanitizeId(playerId);
   if (!securityProfiles.has(safeId)) {
@@ -196,7 +263,7 @@ function securityProfileFor(playerId) {
 }
 
 function applySecurityProfile(data, profile) {
-  const result = data && typeof data === "object" && !Array.isArray(data) ? { ...data } : {};
+  const result = compactCloudData(data);
   result.coins = profile.coins;
   result.player_skin_owned_mask = profile.player_skin_owned_mask;
   result.player_skin_active = (profile.player_skin_owned_mask & (1 << profile.player_skin_active)) !== 0 ? profile.player_skin_active : 0;
@@ -219,7 +286,7 @@ function storeSecurityProfile(playerId, profile) {
     account_id: "",
     data: {}
   };
-  const data = applySecurityProfile(existing.data || {}, profile);
+  const data = applySecurityProfile(compactCloudData(existing.data), profile);
   const next = {
     ...existing,
     player_id: safeId,
@@ -348,7 +415,7 @@ function recordSecurityReport(type, auth, details = {}) {
     status: "open"
   };
   securityReports.unshift(report);
-  if (securityReports.length > 1000) securityReports.length = 1000;
+  if (securityReports.length > MAX_SECURITY_REPORTS) securityReports.length = MAX_SECURITY_REPORTS;
   auditSecurityEvent("suspicious_modified_client_behavior", auth && auth.session, { report_id: report.id, type: report.type });
   return report;
 }
@@ -574,7 +641,6 @@ async function refreshActiveRelease() {
     if (tag && version && asset && compareVersion(version, ACTIVE_LATEST_VERSION) >= 0) {
       ACTIVE_RELEASE_TAG = tag;
       ACTIVE_LATEST_VERSION = version;
-      ACTIVE_MIN_CLIENT_VERSION = version;
       ACTIVE_DOWNLOAD_ASSET_NAME = String(asset.name || `SpaceRocks-v${version}-windows.zip`);
       console.log(`[UPDATE] active release ${ACTIVE_RELEASE_TAG} asset=${ACTIVE_DOWNLOAD_ASSET_NAME}`);
     }
@@ -792,7 +858,7 @@ function auditSecurityEvent(type, session = null, details = {}) {
     details: details && typeof details === "object" ? details : {}
   };
   securityAuditLog.unshift(entry);
-  if (securityAuditLog.length > 1000) securityAuditLog.length = 1000;
+  if (securityAuditLog.length > MAX_AUDIT_ENTRIES) securityAuditLog.length = MAX_AUDIT_ENTRIES;
   console.log(`[AUDIT] ${entry.type} actor=${entry.actor_account_id || "anonymous"} role=${entry.actor_role}`);
   return entry;
 }
@@ -814,7 +880,8 @@ function authSessionForToken(token) {
 
 function accountOnlineId(session) {
   if (!session) return "";
-  const prefix = session.provider === "apple" ? "A" : session.provider === "github" ? "H" : "G";
+  const prefixes = { google: "G", apple: "A", github: "H", steam: "S", roblox: "R", epic: "E", playstation: "P", nintendo: "N" };
+  const prefix = prefixes[String(session.provider || "").toLowerCase()] || "U";
   return sanitizeId(`${prefix}${session.provider_id || session.account_id}`);
 }
 
@@ -830,7 +897,7 @@ function requestAuthContext(req, requestedPlayerId = "") {
 function requireRequestAuth(req, res, requestedPlayerId = "") {
   const context = requestAuthContext(req, requestedPlayerId);
   if (context) return context;
-  sendJson(res, 401, { ok: false, message: "Bitte zuerst mit Google, Apple oder GitHub anmelden." });
+  sendJson(res, 401, { ok: false, message: "Bitte zuerst mit einem verfuegbaren Kontoanbieter anmelden." });
   return null;
 }
 
@@ -863,7 +930,7 @@ function authenticateSocket(ws, msg) {
     ws.accountId = ws.onlineId || "guest";
     return true;
   }
-  send(ws, { cmd: "auth_required", message: "Bitte zuerst mit Google, Apple oder GitHub anmelden." });
+  send(ws, { cmd: "auth_required", message: "Bitte zuerst mit einem verfuegbaren SpaceRocks-Kontoanbieter anmelden." });
   return false;
 }
 
@@ -877,6 +944,44 @@ function appleAuthConfigured() {
 
 function githubAuthConfigured() {
   return Boolean(GITHUB_OAUTH_CLIENT_ID && GITHUB_OAUTH_CLIENT_SECRET);
+}
+
+function steamAuthConfigured() {
+  return STEAM_LOGIN_ENABLED;
+}
+
+function robloxAuthConfigured() {
+  return Boolean(ROBLOX_CLIENT_ID && ROBLOX_CLIENT_SECRET);
+}
+
+function customOAuthConfigured(clientId, clientSecret, authUrl, tokenUrl, userInfoUrl) {
+  return Boolean(clientId && clientSecret && authUrl && tokenUrl && userInfoUrl);
+}
+
+function epicAuthConfigured() {
+  return customOAuthConfigured(EPIC_CLIENT_ID, EPIC_CLIENT_SECRET, EPIC_AUTH_URL, EPIC_TOKEN_URL, EPIC_USERINFO_URL);
+}
+
+function playstationAuthConfigured() {
+  return customOAuthConfigured(PLAYSTATION_CLIENT_ID, PLAYSTATION_CLIENT_SECRET, PLAYSTATION_AUTH_URL, PLAYSTATION_TOKEN_URL, PLAYSTATION_USERINFO_URL);
+}
+
+function nintendoAuthConfigured() {
+  return customOAuthConfigured(NINTENDO_CLIENT_ID, NINTENDO_CLIENT_SECRET, NINTENDO_AUTH_URL, NINTENDO_TOKEN_URL, NINTENDO_USERINFO_URL);
+}
+
+function authProviderConfigured(provider) {
+  const checks = {
+    google: googleAuthConfigured,
+    apple: appleAuthConfigured,
+    github: githubAuthConfigured,
+    steam: steamAuthConfigured,
+    roblox: robloxAuthConfigured,
+    epic: epicAuthConfigured,
+    playstation: playstationAuthConfigured,
+    nintendo: nintendoAuthConfigured
+  };
+  return Object.prototype.hasOwnProperty.call(checks, provider) && checks[provider]();
 }
 
 function base64Url(value) {
@@ -1069,8 +1174,75 @@ async function exchangeAppleCode(code, redirectUri, suppliedUser = "") {
   };
 }
 
+async function exchangeSteamOpenId(callbackParams) {
+  const verification = new URLSearchParams();
+  for (const [key, value] of callbackParams.entries()) {
+    if (key.startsWith("openid.")) verification.set(key, value);
+  }
+  verification.set("openid.mode", "check_authentication");
+  const response = await fetch("https://steamcommunity.com/openid/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: verification
+  });
+  const result = await response.text();
+  if (!response.ok || !/(^|\n)is_valid:true(\n|$)/.test(result)) throw new Error("Steam identity verification failed.");
+  const claimedId = String(callbackParams.get("openid.claimed_id") || "");
+  const match = claimedId.match(/^https?:\/\/steamcommunity\.com\/openid\/id\/(\d{17,20})$/i);
+  if (!match) throw new Error("Steam ID is invalid.");
+
+  const steamId = match[1];
+  let name = `STEAM ${steamId.slice(-6)}`;
+  if (STEAM_WEB_API_KEY) {
+    const profileResponse = await fetch(`https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=${encodeURIComponent(STEAM_WEB_API_KEY)}&steamids=${encodeURIComponent(steamId)}`);
+    const profileData = await profileResponse.json().catch(() => ({}));
+    const player = profileData && profileData.response && Array.isArray(profileData.response.players) ? profileData.response.players[0] : null;
+    if (profileResponse.ok && player && player.personaname) name = player.personaname;
+  }
+  return { provider: "steam", provider_id: steamId, account_id: `steam:${steamId}`, email: "", name: sanitizeName(name) };
+}
+
+async function exchangeGenericOAuthCode(provider, code, redirectUri, config) {
+  const tokenResponse = await fetch(config.tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
+    body: new URLSearchParams({
+      code: String(code || ""),
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code"
+    })
+  });
+  const tokenData = await tokenResponse.json().catch(() => ({}));
+  if (!tokenResponse.ok || !tokenData.access_token) throw new Error(`${provider} token exchange failed.`);
+  const profileResponse = await fetch(config.userInfoUrl, {
+    headers: { "Authorization": `Bearer ${tokenData.access_token}`, "Accept": "application/json" }
+  });
+  const profile = await profileResponse.json().catch(() => ({}));
+  const providerId = String(profile.sub || profile.id || profile.account_id || profile.accountId || profile.user_id || "");
+  if (!profileResponse.ok || !providerId) throw new Error(`${provider} identity verification failed.`);
+  return {
+    provider,
+    provider_id: providerId,
+    account_id: `${provider}:${providerId}`,
+    email: String(profile.email || "").toLowerCase(),
+    name: sanitizeName(profile.name || profile.display_name || profile.displayName || profile.preferred_username || profile.username || `${provider.toUpperCase()} SPIELER`)
+  };
+}
+
+function genericOAuthConfig(provider) {
+  if (provider === "roblox") return { clientId: ROBLOX_CLIENT_ID, clientSecret: ROBLOX_CLIENT_SECRET, authUrl: "https://apis.roblox.com/oauth/v1/authorize", tokenUrl: "https://apis.roblox.com/oauth/v1/token", userInfoUrl: "https://apis.roblox.com/oauth/v1/userinfo", scope: "openid profile" };
+  if (provider === "epic") return { clientId: EPIC_CLIENT_ID, clientSecret: EPIC_CLIENT_SECRET, authUrl: EPIC_AUTH_URL, tokenUrl: EPIC_TOKEN_URL, userInfoUrl: EPIC_USERINFO_URL, scope: "basic_profile" };
+  if (provider === "playstation") return { clientId: PLAYSTATION_CLIENT_ID, clientSecret: PLAYSTATION_CLIENT_SECRET, authUrl: PLAYSTATION_AUTH_URL, tokenUrl: PLAYSTATION_TOKEN_URL, userInfoUrl: PLAYSTATION_USERINFO_URL, scope: "openid profile" };
+  if (provider === "nintendo") return { clientId: NINTENDO_CLIENT_ID, clientSecret: NINTENDO_CLIENT_SECRET, authUrl: NINTENDO_AUTH_URL, tokenUrl: NINTENDO_TOKEN_URL, userInfoUrl: NINTENDO_USERINFO_URL, scope: "openid profile" };
+  return null;
+}
+
 let cloudSavesLoaded = false;
-let cloudSavePersistQueue = Promise.resolve();
+let cloudSavesLoadPromise = null;
+let cloudSavePersistPromise = null;
+let cloudSavePersistDirty = false;
 
 function cloudGithubHeaders() {
   return {
@@ -1086,8 +1258,7 @@ function cloudGithubUrl() {
   return `https://api.github.com/repos/${encodeURIComponent(GITHUB_OWNER)}/${encodeURIComponent(CLOUD_GITHUB_REPO)}/contents/${safePath}`;
 }
 
-async function ensureCloudSavesLoaded() {
-  if (cloudSavesLoaded) return;
+async function loadCloudSavesNow() {
   if (!GITHUB_TOKEN) throw new Error("Cloud persistence token is missing.");
   const response = await fetch(`${cloudGithubUrl()}?ref=${encodeURIComponent(CLOUD_GITHUB_BRANCH)}`, {
     headers: cloudGithubHeaders()
@@ -1101,14 +1272,18 @@ async function ensureCloudSavesLoaded() {
   const parsed = JSON.parse(Buffer.from(String(file.content).replace(/\s/g, ""), "base64").toString("utf8"));
   const saves = parsed && parsed.saves && typeof parsed.saves === "object" ? parsed.saves : {};
   for (const [playerId, save] of Object.entries(saves)) {
-    if (save && typeof save === "object") cloudSaves.set(sanitizeId(playerId), save);
+    const normalized = normalizeCloudSaveRecord(playerId, save);
+    if (normalized) {
+      cloudSaves.set(normalized.player_id, normalized);
+      securityProfiles.set(normalized.player_id, normalized.server_security);
+    }
   }
   const roles = parsed && parsed.roles && typeof parsed.roles === "object" ? parsed.roles : {};
   for (const [accountId, role] of Object.entries(roles)) {
     const safeRole = String(role || "player").toLowerCase();
     if (["helper", "moderator", "admin"].includes(safeRole)) staffRoles.set(String(accountId), safeRole);
   }
-  const audit = parsed && Array.isArray(parsed.audit) ? parsed.audit.slice(0, 1000) : [];
+  const audit = parsed && Array.isArray(parsed.audit) ? parsed.audit.slice(0, MAX_AUDIT_ENTRIES) : [];
   for (const entry of audit) if (entry && typeof entry === "object") securityAuditLog.push(entry);
   const moderation = parsed && parsed.moderation && typeof parsed.moderation === "object" ? parsed.moderation : {};
   for (const record of Array.isArray(moderation.bans) ? moderation.bans : []) {
@@ -1131,7 +1306,7 @@ async function ensureCloudSavesLoaded() {
     const safeId = sanitizeId(playerId);
     if (safeId) leaderboardSoftBans.add(safeId);
   }
-  const storedReports = parsed && Array.isArray(parsed.security_reports) ? parsed.security_reports.slice(0, 500) : [];
+  const storedReports = parsed && Array.isArray(parsed.security_reports) ? parsed.security_reports.slice(0, MAX_SECURITY_REPORTS) : [];
   securityReports.splice(0, securityReports.length, ...storedReports.filter((entry) => entry && typeof entry === "object"));
   const storedAdmin = parsed && parsed.admin_state && typeof parsed.admin_state === "object" ? parsed.admin_state : {};
   if (storedAdmin.maintenance && typeof storedAdmin.maintenance === "object") {
@@ -1142,44 +1317,115 @@ async function ensureCloudSavesLoaded() {
     };
   }
   for (const key of ["events", "announcements", "beta_testers", "appeals", "notes"]) {
-    adminState[key] = Array.isArray(storedAdmin[key]) ? storedAdmin[key].filter((entry) => entry && typeof entry === "object").slice(0, 500) : [];
+    adminState[key] = Array.isArray(storedAdmin[key]) ? storedAdmin[key].filter((entry) => entry && typeof entry === "object").slice(0, ADMIN_COLLECTION_LIMITS[key]) : [];
   }
   cloudSavesLoaded = true;
 }
 
-async function persistCloudSavesNow() {
-  if (!GITHUB_TOKEN) throw new Error("Cloud persistence token is missing.");
-  const readResponse = await fetch(`${cloudGithubUrl()}?ref=${encodeURIComponent(CLOUD_GITHUB_BRANCH)}`, {
-    headers: cloudGithubHeaders()
-  });
-  const current = await readResponse.json().catch(() => ({}));
-  if (!readResponse.ok && readResponse.status !== 404) throw new Error("Cloud save storage metadata could not be loaded.");
-  const saves = Object.fromEntries(cloudSaves.entries());
+async function ensureCloudSavesLoaded() {
+  if (cloudSavesLoaded) return;
+  if (!cloudSavesLoadPromise) {
+    cloudSavesLoadPromise = loadCloudSavesNow().finally(() => { cloudSavesLoadPromise = null; });
+  }
+  return cloudSavesLoadPromise;
+}
+
+function buildStoragePayload() {
+  const saves = {};
+  for (const [playerId, rawSave] of cloudSaves.entries()) {
+    const normalized = normalizeCloudSaveRecord(playerId, rawSave);
+    if (!normalized) continue;
+    cloudSaves.set(normalized.player_id, normalized);
+    securityProfiles.set(normalized.player_id, normalized.server_security);
+    saves[normalized.player_id] = normalized;
+  }
   const roles = Object.fromEntries(staffRoles.entries());
   const moderation = {
     bans: publicBanList(),
-    warnings: Object.fromEntries(warningsByPlayer.entries()),
+    warnings: Object.fromEntries(Array.from(warningsByPlayer.entries()).map(([id, entries]) => [id, Array.isArray(entries) ? entries.slice(0, 50) : []])),
     mutes: Object.fromEntries(mutesByPlayer.entries()),
     shadow_bans: Array.from(shadowBans),
     leaderboard_soft_bans: Array.from(leaderboardSoftBans)
   };
-  const body = {
-    message: "Update SpaceRocks account cloud saves",
-    content: Buffer.from(JSON.stringify({ version: 4, updated_at: new Date().toISOString(), saves, roles, moderation, security_reports: securityReports.slice(0, 500), admin_state: adminState, audit: securityAuditLog.slice(0, 1000) }, null, 2)).toString("base64"),
-    branch: CLOUD_GITHUB_BRANCH
+  const compactAdminState = {
+    maintenance: adminState.maintenance,
+    events: adminState.events.slice(0, ADMIN_COLLECTION_LIMITS.events),
+    announcements: adminState.announcements.slice(0, ADMIN_COLLECTION_LIMITS.announcements),
+    beta_testers: adminState.beta_testers.slice(0, ADMIN_COLLECTION_LIMITS.beta_testers),
+    appeals: adminState.appeals.slice(0, ADMIN_COLLECTION_LIMITS.appeals),
+    notes: adminState.notes.slice(0, ADMIN_COLLECTION_LIMITS.notes)
   };
-  if (current.sha) body.sha = current.sha;
-  const writeResponse = await fetch(cloudGithubUrl(), {
-    method: "PUT",
-    headers: { ...cloudGithubHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  if (!writeResponse.ok) throw new Error("Cloud save storage could not be persisted.");
+  return { version: 6, updated_at: new Date().toISOString(), saves, roles, moderation, security_reports: securityReports.slice(0, MAX_SECURITY_REPORTS), admin_state: compactAdminState, audit: securityAuditLog.slice(0, MAX_AUDIT_ENTRIES) };
+}
+
+function storagePayloadStats() {
+  const payload = buildStoragePayload();
+  const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+  const usage = Math.round((bytes / MAX_STORAGE_FILE_BYTES) * 1000) / 10;
+  return { payload, bytes, usage, health: usage >= 90 ? "CRITICAL" : usage >= 70 ? "WARNING" : "OK" };
+}
+
+async function persistCloudSavesNow() {
+  if (!GITHUB_TOKEN) throw new Error("Cloud persistence token is missing.");
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const readResponse = await fetch(`${cloudGithubUrl()}?ref=${encodeURIComponent(CLOUD_GITHUB_BRANCH)}`, { headers: cloudGithubHeaders() });
+    const current = await readResponse.json().catch(() => ({}));
+    if (!readResponse.ok && readResponse.status !== 404) throw new Error(`Cloud storage metadata HTTP ${readResponse.status}.`);
+
+    const stats = storagePayloadStats();
+    if (stats.bytes > MAX_STORAGE_FILE_BYTES) {
+      const error = new Error(`Cloud storage limit reached (${stats.bytes}/${MAX_STORAGE_FILE_BYTES} bytes).`);
+      error.code = "STORAGE_LIMIT";
+      throw error;
+    }
+
+    const body = {
+      message: "Update SpaceRocks account cloud saves",
+      content: Buffer.from(JSON.stringify(stats.payload)).toString("base64"),
+      branch: CLOUD_GITHUB_BRANCH
+    };
+    if (current.sha) body.sha = current.sha;
+    const writeResponse = await fetch(cloudGithubUrl(), {
+      method: "PUT",
+      headers: { ...cloudGithubHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (writeResponse.ok) return stats;
+
+    const message = await writeResponse.text().catch(() => "");
+    if ((writeResponse.status === 409 || writeResponse.status === 422) && attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+      continue;
+    }
+    throw new Error(`Cloud storage HTTP ${writeResponse.status}: ${message.slice(0, 180)}`);
+  }
+  throw new Error("Cloud storage write retry limit reached.");
 }
 
 function persistCloudSaves() {
-  cloudSavePersistQueue = cloudSavePersistQueue.catch(() => {}).then(() => persistCloudSavesNow());
-  return cloudSavePersistQueue;
+  cloudSavePersistDirty = true;
+  if (!cloudSavePersistPromise) {
+    cloudSavePersistPromise = (async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      let result = null;
+      while (cloudSavePersistDirty) {
+        cloudSavePersistDirty = false;
+        result = await persistCloudSavesNow();
+      }
+      return result;
+    })().finally(() => { cloudSavePersistPromise = null; });
+  }
+  return cloudSavePersistPromise;
+}
+
+function sendStorageError(res, error, area = "Cloud") {
+  const full = error && error.code === "STORAGE_LIMIT";
+  console.error(`[STORAGE] ${area}:`, error && error.message ? error.message : error);
+  sendJson(res, full ? 507 : 503, {
+    ok: false,
+    error_code: full ? "storage_full" : "storage_unavailable",
+    message: full ? "Cloud storage is full. Run STORAGE KOMPAKT in Admin Settings." : `${area} storage is temporarily unavailable.`
+  });
 }
 
 function connectionIpHash(ws) {
@@ -2082,6 +2328,18 @@ const server = http.createServer(async (req, res) => {
 
   if (enforceRateLimit(req, res, url.pathname)) return;
 
+  if (url.pathname.startsWith("/admin/")) {
+    const adminAuth = requestAuthContext(req);
+    if (adminAuth && adminAuth.session) {
+      try {
+        await ensureCloudSavesLoaded();
+      } catch (error) {
+        sendStorageError(res, error, "Admin");
+        return;
+      }
+    }
+  }
+
   if (url.pathname === "/auth/start" || url.pathname === "/auth/login-google" || url.pathname === "/auth/login-github") {
     cleanAuthState();
     const provider = url.pathname === "/auth/login-google"
@@ -2089,34 +2347,43 @@ const server = http.createServer(async (req, res) => {
       : url.pathname === "/auth/login-github"
         ? "github"
         : String(url.searchParams.get("provider") || "google").toLowerCase();
-    const providerConfigured = provider === "google"
-      ? googleAuthConfigured()
-      : provider === "apple"
-        ? appleAuthConfigured()
-        : provider === "github"
-          ? githubAuthConfigured()
-          : false;
-    if (!providerConfigured) {
+    if (!authProviderConfigured(provider)) {
       sendJson(res, 503, { ok: false, message: `${provider} Login ist noch nicht konfiguriert.` });
       return;
     }
     const state = makeToken();
-    const redirectUri = `${serverOrigin(req)}/auth/callback/${provider}`;
+    const redirectUri = `${serverOrigin(req)}/auth/callback/${provider}${provider === "steam" ? `?state=${encodeURIComponent(state)}` : ""}`;
     authRequests.set(state, { provider, status: "pending", createdAt: Date.now(), redirectUri });
+
+    if (provider === "steam") {
+      const steamUrl = new URL("https://steamcommunity.com/openid/login");
+      steamUrl.searchParams.set("openid.ns", "http://specs.openid.net/auth/2.0");
+      steamUrl.searchParams.set("openid.mode", "checkid_setup");
+      steamUrl.searchParams.set("openid.return_to", redirectUri);
+      steamUrl.searchParams.set("openid.realm", serverOrigin(req));
+      steamUrl.searchParams.set("openid.identity", "http://specs.openid.net/auth/2.0/identifier_select");
+      steamUrl.searchParams.set("openid.claimed_id", "http://specs.openid.net/auth/2.0/identifier_select");
+      sendJson(res, 200, { ok: true, provider, state, auth_url: steamUrl.toString(), expires_in_seconds: 600 });
+      return;
+    }
+
+    const genericConfig = genericOAuthConfig(provider);
     const authEndpoint = provider === "apple"
       ? "https://appleid.apple.com/auth/authorize"
       : provider === "github"
         ? "https://github.com/login/oauth/authorize"
-        : "https://accounts.google.com/o/oauth2/v2/auth";
+        : provider === "google"
+          ? "https://accounts.google.com/o/oauth2/v2/auth"
+          : genericConfig.authUrl;
     const authUrl = new URL(authEndpoint);
-    const clientId = provider === "apple" ? APPLE_CLIENT_ID : provider === "github" ? GITHUB_OAUTH_CLIENT_ID : GOOGLE_CLIENT_ID;
+    const clientId = provider === "apple" ? APPLE_CLIENT_ID : provider === "github" ? GITHUB_OAUTH_CLIENT_ID : provider === "google" ? GOOGLE_CLIENT_ID : genericConfig.clientId;
     authUrl.searchParams.set("client_id", clientId);
     authUrl.searchParams.set("redirect_uri", redirectUri);
     authUrl.searchParams.set("response_type", "code");
-    authUrl.searchParams.set("scope", provider === "apple" ? "name email" : provider === "github" ? "read:user user:email" : "openid email profile");
+    authUrl.searchParams.set("scope", provider === "apple" ? "name email" : provider === "github" ? "read:user user:email" : provider === "google" ? "openid email profile" : genericConfig.scope);
     authUrl.searchParams.set("state", state);
     if (provider === "apple") authUrl.searchParams.set("response_mode", "form_post");
-    else if (provider === "google") authUrl.searchParams.set("prompt", "select_account");
+    else if (provider === "google" || provider === "roblox") authUrl.searchParams.set("prompt", "select_account");
     sendJson(res, 200, { ok: true, provider, state, auth_url: authUrl.toString(), expires_in_seconds: 600 });
     return;
   }
@@ -2139,7 +2406,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === "/auth/callback/google" || url.pathname === "/auth/callback/apple" || url.pathname === "/auth/callback/github") {
+  if (/^\/auth\/callback\/(google|apple|github|steam|roblox|epic|playstation|nintendo)$/.test(url.pathname)) {
     cleanAuthState();
     let callbackParams = url.searchParams;
     if (req.method === "POST") callbackParams = new URLSearchParams(await readBody(req));
@@ -2149,13 +2416,14 @@ const server = http.createServer(async (req, res) => {
     let title = "SpaceRocks Login fehlgeschlagen";
     let message = "Die Anmeldung konnte nicht abgeschlossen werden.";
 
-    if (request && code) {
+    if (request && (code || request.provider === "steam")) {
       try {
-        const account = request.provider === "apple"
-          ? await exchangeAppleCode(code, request.redirectUri, callbackParams.get("user") || "")
-          : request.provider === "github"
-            ? await exchangeGithubCode(code, request.redirectUri)
-            : await exchangeGoogleCode(code, request.redirectUri);
+        let account;
+        if (request.provider === "apple") account = await exchangeAppleCode(code, request.redirectUri, callbackParams.get("user") || "");
+        else if (request.provider === "github") account = await exchangeGithubCode(code, request.redirectUri);
+        else if (request.provider === "google") account = await exchangeGoogleCode(code, request.redirectUri);
+        else if (request.provider === "steam") account = await exchangeSteamOpenId(callbackParams);
+        else account = await exchangeGenericOAuthCode(request.provider, code, request.redirectUri, genericOAuthConfig(request.provider));
         const sessionToken = issueAuthSession(account);
         request.status = "complete";
         request.sessionToken = sessionToken;
@@ -2233,7 +2501,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, account_id: accountId, role });
     } catch (error) {
       if (previousRole) staffRoles.set(accountId, previousRole); else staffRoles.delete(accountId);
-      sendJson(res, 503, { ok: false, message: "Role storage unavailable." });
+      sendStorageError(res, error, "Role");
     }
     return;
   }
@@ -2256,7 +2524,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, account_id: accountId, removed });
     } catch (error) {
       if (previousRole) staffRoles.set(accountId, previousRole);
-      sendJson(res, 503, { ok: false, message: "Role storage unavailable." });
+      sendStorageError(res, error, "Role");
     }
     return;
   }
@@ -2315,7 +2583,7 @@ const server = http.createServer(async (req, res) => {
     report.reviewed_by = String(auth.session.account_id || "");
     auditSecurityEvent("admin_report_action", auth.session, { report_id: report.id, status, reason: report.resolution });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, report }); }
-    catch { sendJson(res, 503, { ok: false, message: "Report storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Report"); }
     return;
   }
 
@@ -2338,7 +2606,7 @@ const server = http.createServer(async (req, res) => {
     else if (kind === "leaderboard_soft_ban") changed = leaderboardSoftBans.delete(playerId);
     auditSecurityEvent("admin_moderation_revoke", auth.session, { target_player_id: playerId, kind, changed, reason: cleanAdminText(body.reason, 160) });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, changed }); }
-    catch { sendJson(res, 503, { ok: false, message: "Moderation storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Moderation"); }
     return;
   }
 
@@ -2353,7 +2621,7 @@ const server = http.createServer(async (req, res) => {
     const auth = requireRequestPermission(req, res, config.permission);
     if (!auth) return;
     if (operation === "list") {
-      sendJson(res, 200, { ok: true, items: config.list.slice(0, 200) });
+      sendJson(res, 200, { ok: true, items: config.list.slice(0, ADMIN_COLLECTION_LIMITS[contentMatch[1]]) });
       return;
     }
     if (req.method !== "POST") { sendJson(res, 405, { ok: false, message: "POST required." }); return; }
@@ -2364,10 +2632,10 @@ const server = http.createServer(async (req, res) => {
       if (!title || !message) { sendJson(res, 400, { ok: false, message: "Title and message are required." }); return; }
       const record = adminRecord(contentMatch[1].slice(0, -1), { title, message, enabled: body.enabled !== false, starts_at: cleanAdminText(body.starts_at, 40), ends_at: cleanAdminText(body.ends_at, 40) }, auth.session);
       config.list.unshift(record);
-      if (config.list.length > 200) config.list.length = 200;
+      if (config.list.length > ADMIN_COLLECTION_LIMITS[contentMatch[1]]) config.list.length = ADMIN_COLLECTION_LIMITS[contentMatch[1]];
       auditSecurityEvent(`admin_${contentMatch[1]}_create`, auth.session, { id: record.id, title });
       try { await persistCloudSaves(); sendJson(res, 201, { ok: true, item: record }); }
-      catch { config.list.shift(); sendJson(res, 503, { ok: false, message: "Admin content storage unavailable." }); }
+      catch (error) { config.list.shift(); sendStorageError(res, error, "Admin content"); }
       return;
     }
     const record = findAdminRecord(config.list, body.id);
@@ -2377,7 +2645,7 @@ const server = http.createServer(async (req, res) => {
     else removeAdminRecord(config.list, record.id);
     auditSecurityEvent(`admin_${contentMatch[1]}_${action}`, auth.session, { id: record.id });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, item: record }); }
-    catch { sendJson(res, 503, { ok: false, message: "Admin content storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Admin content"); }
     return;
   }
 
@@ -2395,7 +2663,7 @@ const server = http.createServer(async (req, res) => {
     adminState.maintenance = { enabled: body.enabled === true, message: cleanAdminText(body.message || adminState.maintenance.message, 240), updated_at: new Date().toISOString() };
     auditSecurityEvent("admin_maintenance_set", auth.session, adminState.maintenance);
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, maintenance: adminState.maintenance }); }
-    catch { sendJson(res, 503, { ok: false, message: "Maintenance storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Maintenance"); }
     return;
   }
 
@@ -2413,11 +2681,14 @@ const server = http.createServer(async (req, res) => {
     const accountId = cleanAdminText(body.account_id, 160);
     const action = String(body.action || "grant").toLowerCase();
     if (!accountId || !["grant", "revoke"].includes(action)) { sendJson(res, 400, { ok: false, message: "Account and action are required." }); return; }
-    if (action === "grant" && !adminState.beta_testers.some((entry) => entry.account_id === accountId)) adminState.beta_testers.unshift(adminRecord("beta_tester", { account_id: accountId }, auth.session));
+    if (action === "grant" && !adminState.beta_testers.some((entry) => entry.account_id === accountId)) {
+      adminState.beta_testers.unshift(adminRecord("beta_tester", { account_id: accountId }, auth.session));
+      if (adminState.beta_testers.length > ADMIN_COLLECTION_LIMITS.beta_testers) adminState.beta_testers.length = ADMIN_COLLECTION_LIMITS.beta_testers;
+    }
     if (action === "revoke") adminState.beta_testers = adminState.beta_testers.filter((entry) => entry.account_id !== accountId);
     auditSecurityEvent(`admin_beta_${action}`, auth.session, { account_id: accountId });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, items: adminState.beta_testers }); }
-    catch { sendJson(res, 503, { ok: false, message: "Beta storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Beta"); }
     return;
   }
 
@@ -2439,7 +2710,7 @@ const server = http.createServer(async (req, res) => {
     if (status === "approved") removePlayerBan(appeal.player_id);
     auditSecurityEvent("admin_appeal_action", auth.session, { id: appeal.id, status, player_id: appeal.player_id });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, item: appeal }); }
-    catch { sendJson(res, 503, { ok: false, message: "Appeal storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Appeal"); }
     return;
   }
 
@@ -2459,19 +2730,22 @@ const server = http.createServer(async (req, res) => {
       const message = cleanAdminText(body.message, 300);
       if (!message) { sendJson(res, 400, { ok: false, message: "Note text is required." }); return; }
       adminState.notes.unshift(adminRecord("admin_note", { player_id: sanitizeId(body.player_id), message }, auth.session));
+      if (adminState.notes.length > ADMIN_COLLECTION_LIMITS.notes) adminState.notes.length = ADMIN_COLLECTION_LIMITS.notes;
     } else if (action === "delete") {
       if (!removeAdminRecord(adminState.notes, body.id)) { sendJson(res, 404, { ok: false, message: "Note not found." }); return; }
     } else { sendJson(res, 400, { ok: false, message: "Invalid note action." }); return; }
     auditSecurityEvent(`admin_note_${action}`, auth.session, { id: String(body.id || ""), player_id: sanitizeId(body.player_id) });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, items: adminState.notes.slice(0, 300) }); }
-    catch { sendJson(res, 503, { ok: false, message: "Note storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Note"); }
     return;
   }
 
   if (url.pathname === "/admin/settings/status") {
     const auth = requireRequestPermission(req, res, "can_use_dangerous_tools");
     if (!auth) return;
-    sendJson(res, 200, { ok: true, settings: { auth_required: AUTH_REQUIRED, owner_auth_configured: ownerIdentityConfigured(), cloud_persistence: Boolean(GITHUB_TOKEN), rate_limit_buckets: rateLimitBuckets.size, auth_sessions: authSessions.size, score_sessions: scoreSessions.size, maintenance: adminState.maintenance, latest_version: ACTIVE_LATEST_VERSION, min_client_version: ACTIVE_MIN_CLIENT_VERSION } });
+    const adminRecordCount = adminState.events.length + adminState.announcements.length + adminState.beta_testers.length + adminState.appeals.length + adminState.notes.length;
+    const storageStats = storagePayloadStats();
+    sendJson(res, 200, { ok: true, settings: { auth_required: AUTH_REQUIRED, owner_auth_configured: ownerIdentityConfigured(), cloud_persistence: Boolean(GITHUB_TOKEN), rate_limit_buckets: rateLimitBuckets.size, auth_sessions: authSessions.size, score_sessions: scoreSessions.size, cloud_save_count: cloudSaves.size, storage_bytes_estimate: storageStats.bytes, storage_limit_bytes: MAX_STORAGE_FILE_BYTES, storage_usage_percent: storageStats.usage, storage_health: storageStats.health, audit_entries: securityAuditLog.length, audit_limit: MAX_AUDIT_ENTRIES, report_entries: securityReports.length, report_limit: MAX_SECURITY_REPORTS, admin_records: adminRecordCount, maintenance: adminState.maintenance, latest_version: ACTIVE_LATEST_VERSION, min_client_version: ACTIVE_MIN_CLIENT_VERSION } });
     return;
   }
 
@@ -2480,12 +2754,22 @@ const server = http.createServer(async (req, res) => {
     if (!auth) return;
     const body = await readJson(req);
     const action = String(body.action || "").toLowerCase();
-    if (String(body.confirm || "") !== "CONFIRM" || !["persist", "clear_rate_limits", "cleanup_sessions"].includes(action)) { sendJson(res, 400, { ok: false, message: "Valid action and CONFIRM are required." }); return; }
+    if (String(body.confirm || "") !== "CONFIRM" || !["persist", "clear_rate_limits", "cleanup_sessions", "compact_storage"].includes(action)) { sendJson(res, 400, { ok: false, message: "Valid action and CONFIRM are required." }); return; }
     if (action === "clear_rate_limits") rateLimitBuckets.clear();
     if (action === "cleanup_sessions") cleanAuthState();
+    if (action === "compact_storage") {
+      securityAuditLog.length = Math.min(securityAuditLog.length, 120);
+      const openReports = securityReports.filter((entry) => entry && entry.status === "open");
+      const closedReports = securityReports.filter((entry) => entry && entry.status !== "open").slice(0, 30);
+      securityReports.splice(0, securityReports.length, ...openReports.slice(0, 100), ...closedReports);
+      adminState.events = adminState.events.slice(0, 20);
+      adminState.announcements = adminState.announcements.slice(0, 20);
+      adminState.appeals = adminState.appeals.filter((entry) => entry.status === "open").concat(adminState.appeals.filter((entry) => entry.status !== "open").slice(0, 40)).slice(0, 80);
+      adminState.notes = adminState.notes.slice(0, 100);
+    }
     auditSecurityEvent(`admin_settings_${action}`, auth.session, {});
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, action }); }
-    catch { sendJson(res, 503, { ok: false, message: "Admin storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Admin"); }
     return;
   }
 
@@ -2613,7 +2897,7 @@ const server = http.createServer(async (req, res) => {
       await persistCloudSaves();
       sendJson(res, 200, { ok: true, action: config.action, player_id: playerId, changed, profile: adminPlayerProfile(playerId) });
     } catch (error) {
-      sendJson(res, 503, { ok: false, message: "Moderation storage unavailable." });
+      sendStorageError(res, error, "Moderation");
     }
     return;
   }
@@ -2648,7 +2932,7 @@ const server = http.createServer(async (req, res) => {
       await persistCloudSaves();
       sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId), before, after: profile.coins });
     } catch (error) {
-      sendJson(res, 503, { ok: false, message: "Economy storage unavailable." });
+      sendStorageError(res, error, "Economy");
     }
     return;
   }
@@ -2692,7 +2976,7 @@ const server = http.createServer(async (req, res) => {
       await persistCloudSaves();
       sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId), before_mask: beforeMask, after_mask: profile.player_skin_owned_mask });
     } catch (error) {
-      sendJson(res, 503, { ok: false, message: "Skin storage unavailable." });
+      sendStorageError(res, error, "Skin");
     }
     return;
   }
@@ -2719,7 +3003,7 @@ const server = http.createServer(async (req, res) => {
     storeSecurityProfile(playerId, profile);
     auditSecurityEvent(`admin_skins_${action}`, auth.session, { target_player_id: playerId, before_mask: beforeMask, after_mask: profile.player_skin_owned_mask, reason });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId) }); }
-    catch { sendJson(res, 503, { ok: false, message: "Skin storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Skin"); }
     return;
   }
 
@@ -2736,7 +3020,7 @@ const server = http.createServer(async (req, res) => {
     storeSecurityProfile(playerId, profile);
     auditSecurityEvent("admin_skin_equip", auth.session, { target_player_id: playerId, skin_id: skinId, reason: cleanAdminText(body.reason, 160) });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId) }); }
-    catch { sendJson(res, 503, { ok: false, message: "Skin storage unavailable." }); }
+    catch (error) { sendStorageError(res, error, "Skin"); }
     return;
   }
 
@@ -2754,7 +3038,7 @@ const server = http.createServer(async (req, res) => {
     if (save) { save.data = applySecurityProfile({}, reset); save.server_security = reset; save.updated_at = new Date().toISOString(); }
     auditSecurityEvent("admin_reset_progress", auth.session, { target_player_id: playerId, reason, previous_coins: previous.coins });
     try { await persistCloudSaves(); sendJson(res, 200, { ok: true, profile: adminPlayerProfile(playerId) }); }
-    catch { storeSecurityProfile(playerId, previous); sendJson(res, 503, { ok: false, message: "Progress storage unavailable." }); }
+    catch (error) { storeSecurityProfile(playerId, previous); sendStorageError(res, error, "Progress"); }
     return;
   }
 
@@ -2813,6 +3097,11 @@ const server = http.createServer(async (req, res) => {
       google_auth_configured: googleAuthConfigured(),
       apple_auth_configured: appleAuthConfigured(),
       github_auth_configured: githubAuthConfigured(),
+      steam_auth_configured: steamAuthConfigured(),
+      roblox_auth_configured: robloxAuthConfigured(),
+      epic_auth_configured: epicAuthConfigured(),
+      playstation_auth_configured: playstationAuthConfigured(),
+      nintendo_auth_configured: nintendoAuthConfigured(),
       cloud_persistence_configured: Boolean(GITHUB_TOKEN && CLOUD_GITHUB_REPO && CLOUD_GITHUB_BRANCH),
       live_matches: liveMatches().length,
       active_spectators: Array.from(rooms.values()).reduce((sum, room) => sum + roomSpectators(room).length, 0),
@@ -3233,12 +3522,19 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 400, { ok: false, message: "Cloud save needs player_id and data." });
       return;
     }
+    const compactData = compactCloudData(body.data);
+    const saveBytes = Buffer.byteLength(JSON.stringify(compactData), "utf8");
+    if (saveBytes > MAX_CLOUD_SAVE_BYTES) {
+      recordSecurityReport("cloud_save_payload_too_large", auth, { bytes: saveBytes, limit: MAX_CLOUD_SAVE_BYTES });
+      sendJson(res, 413, { ok: false, message: "Cloud save is too large. Local or unknown fields must be removed.", max_bytes: MAX_CLOUD_SAVE_BYTES });
+      return;
+    }
 
     const profile = securityProfileFor(playerId);
-    const transition = validateAndApplyProtectedTransition(profile, body.data);
+    const transition = validateAndApplyProtectedTransition(profile, compactData);
     if (!transition.ok) recordSecurityReport("invalid_cloud_save_values", auth, { reason: transition.reason });
 
-    const safeData = applySecurityProfile(body.data, profile);
+    const safeData = applySecurityProfile(compactData, profile);
     const save = {
       player_id: playerId,
       player_name: sanitizeName(body.player_name || playerId),
@@ -3247,12 +3543,14 @@ const server = http.createServer(async (req, res) => {
       updated_at: new Date().toISOString()
     };
 
+    const previousSave = cloudSaves.get(playerId) || null;
     cloudSaves.set(playerId, save);
     try {
       await persistCloudSaves();
       sendJson(res, 200, { ok: true, save, protected: true, tamper_blocked: !transition.ok, message: transition.ok ? "Protected values accepted." : transition.reason });
     } catch (error) {
-      sendJson(res, 503, { ok: false, message: error.message || "Cloud save could not be persisted." });
+      if (previousSave) cloudSaves.set(playerId, previousSave); else cloudSaves.delete(playerId);
+      sendStorageError(res, error, "Cloud save");
     }
     return;
   }
@@ -3266,6 +3564,7 @@ const server = http.createServer(async (req, res) => {
     if (adminState.appeals.some((entry) => entry.player_id === auth.playerId && entry.status === "open")) { sendJson(res, 409, { ok: false, message: "An open appeal already exists." }); return; }
     const appeal = adminRecord("appeal", { player_id: auth.playerId, player_name: sanitizeName(auth.session && auth.session.name), message, status: "open" }, auth.session);
     adminState.appeals.unshift(appeal);
+    if (adminState.appeals.length > ADMIN_COLLECTION_LIMITS.appeals) adminState.appeals.length = ADMIN_COLLECTION_LIMITS.appeals;
     auditSecurityEvent("appeal_submitted", auth.session, { id: appeal.id });
     try { await persistCloudSaves(); sendJson(res, 201, { ok: true, appeal_id: appeal.id }); }
     catch { adminState.appeals.shift(); sendJson(res, 503, { ok: false, message: "Appeal storage unavailable." }); }
