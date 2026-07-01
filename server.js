@@ -127,6 +127,13 @@ const warningsByPlayer = new Map();
 const mutesByPlayer = new Map();
 const adminState = {
   maintenance: { enabled: false, message: "SpaceRocks wird gerade gewartet.", updated_at: "" },
+  owner_event_mode: false,
+  leaderboard_frozen: false,
+  economy_frozen: false,
+  shop_enabled: true,
+  online_enabled: true,
+  beta_mode: false,
+  force_update: false,
   events: [],
   announcements: [],
   beta_testers: [],
@@ -896,7 +903,7 @@ function authSessionForToken(token) {
 
 function accountOnlineId(session) {
   if (!session) return "";
-  const prefixes = { google: "G", apple: "A", github: "H", steam: "S", roblox: "R", epic: "E", playstation: "P", nintendo: "N" };
+  const prefixes = { google: "G", apple: "A", github: "H", discord: "D", microsoft: "X", twitch: "T", opera_gx: "O", itchio: "I", steam: "S", roblox: "R", epic: "E", playstation: "P", nintendo: "N" };
   const prefix = prefixes[String(session.provider || "").toLowerCase()] || "U";
   return sanitizeId(`${prefix}${session.provider_id || session.account_id}`);
 }
@@ -926,6 +933,18 @@ function requireRequestPermission(req, res, permission) {
   }
   auditSecurityEvent("admin_permission_check_failure", auth.session, { permission: String(permission) });
   sendJson(res, 403, { ok: false, message: "Permission denied." });
+  return null;
+}
+
+function requireOwnerRequest(req, res) {
+  const auth = requireRequestAuth(req, res);
+  if (!auth) return null;
+  if (ownerSessionMatches(auth.session)) {
+    auditSecurityEvent("owner_verification_success", auth.session, {});
+    return auth;
+  }
+  auditSecurityEvent("owner_verification_failure", auth.session, {});
+  sendJson(res, 403, { ok: false, message: "Verified owner account required." });
   return null;
 }
 
@@ -1363,6 +1382,8 @@ async function loadCloudSavesNow() {
       updated_at: String(storedAdmin.maintenance.updated_at || "")
     };
   }
+  for (const key of ["owner_event_mode", "leaderboard_frozen", "economy_frozen", "beta_mode", "force_update"]) adminState[key] = storedAdmin[key] === true;
+  for (const key of ["shop_enabled", "online_enabled"]) adminState[key] = storedAdmin[key] !== false;
   for (const key of ["events", "announcements", "beta_testers", "appeals", "notes"]) {
     adminState[key] = Array.isArray(storedAdmin[key]) ? storedAdmin[key].filter((entry) => entry && typeof entry === "object").slice(0, ADMIN_COLLECTION_LIMITS[key]) : [];
   }
@@ -1396,6 +1417,13 @@ function buildStoragePayload() {
   };
   const compactAdminState = {
     maintenance: adminState.maintenance,
+    owner_event_mode: adminState.owner_event_mode,
+    leaderboard_frozen: adminState.leaderboard_frozen,
+    economy_frozen: adminState.economy_frozen,
+    shop_enabled: adminState.shop_enabled,
+    online_enabled: adminState.online_enabled,
+    beta_mode: adminState.beta_mode,
+    force_update: adminState.force_update,
     events: adminState.events.slice(0, ADMIN_COLLECTION_LIMITS.events),
     announcements: adminState.announcements.slice(0, ADMIN_COLLECTION_LIMITS.announcements),
     beta_testers: adminState.beta_testers.slice(0, ADMIN_COLLECTION_LIMITS.beta_testers),
@@ -2581,6 +2609,233 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/owner/state") {
+    const auth = requireOwnerRequest(req, res);
+    if (!auth) return;
+    try { await ensureCloudSavesLoaded(); } catch (error) {
+      sendJson(res, 503, { ok: false, message: "Owner storage unavailable." });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      owner_verified: true,
+      owner_event_mode: adminState.owner_event_mode,
+      admin_modified: false,
+      flags: {
+        leaderboard_frozen: adminState.leaderboard_frozen,
+        economy_frozen: adminState.economy_frozen,
+        shop_enabled: adminState.shop_enabled,
+        online_enabled: adminState.online_enabled,
+        beta_mode: adminState.beta_mode,
+        force_update: adminState.force_update,
+        maintenance: adminState.maintenance.enabled
+      },
+      players: knownPlayerRecords().filter((player) => player.online).slice(0, 100),
+      matches: liveMatches().slice(0, 100),
+      audit: securityAuditLog.slice(0, 80)
+    });
+    return;
+  }
+
+  if (url.pathname === "/owner/action" && req.method === "POST") {
+    const auth = requireOwnerRequest(req, res);
+    if (!auth) return;
+    const body = await readJson(req);
+    let action = String(body.action || "").toLowerCase().trim().slice(0, 60);
+    const target = sanitizeId(body.target);
+    const value = cleanAdminText(body.value, 80);
+    const message = cleanAdminText(body.message, 240);
+    const confirmed = body.confirmed === true;
+    const supported = new Set([
+      "refresh", "spectate", "teleport_to", "teleport_here", "freeze_player", "unfreeze_player",
+      "respawn_player", "heal_player", "damage_player", "eliminate_player", "kick_player", "warn_player",
+      "mute_player", "ban_player", "unban_player", "force_logout", "mark_suspicious", "owner_note",
+      "start_match", "end_match", "restart_match", "pause_match", "resume_match", "force_rematch",
+      "balance_teams", "lock_lobby", "unlock_lobby", "close_lobby", "open_lobby", "set_match_timer",
+      "set_score_limit", "set_wave", "move_team", "event_meteor_storm", "event_asteroid_rain",
+      "event_black_hole", "event_gravity_well", "event_boss_asteroid", "event_enemy_wave",
+      "event_rare_pickup", "event_coin_rain", "event_rainbow", "event_explosion", "event_screen_shake",
+      "event_slow_motion", "event_speed_boost", "event_double_damage", "event_low_gravity", "event_chaos",
+      "event_sudden_death", "event_boss_rush", "event_laser_storm", "event_emp", "event_shield_bubble",
+      "event_random_powerup", "event_everyone_dash", "event_one_life", "event_arena_shrink",
+      "owner_event_on", "owner_event_off", "give_coins", "remove_coins", "daily_compensation",
+      "double_coins", "double_score", "beta_grant", "beta_remove", "mass_reward_online",
+      "mass_reward_lobby", "economy_freeze", "economy_unfreeze", "shop_disable", "shop_enable",
+      "sale_start", "sale_stop", "set_discount", "block_suspicious_economy", "give_skin",
+      "remove_skin", "give_all_skins", "leaderboard_freeze", "leaderboard_unfreeze",
+      "leaderboard_suspicious", "leaderboard_soft_ban", "leaderboard_unban", "emergency_lockdown",
+      "end_lockdown", "online_disable", "online_enable", "maintenance_on", "maintenance_off",
+      "force_update_on", "force_update_off", "beta_mode_on", "beta_mode_off", "execute_command"
+    ]);
+    if (!supported.has(action)) {
+      auditSecurityEvent("owner_action_unsupported", auth.session, { action, target });
+      sendJson(res, 501, { ok: false, message: "Owner action is not implemented." });
+      return;
+    }
+    if (action === "refresh") {
+      sendJson(res, 200, { ok: true, message: "Owner state refreshed.", admin_modified: false });
+      return;
+    }
+    if (!confirmed) {
+      sendJson(res, 400, { ok: false, message: "Owner action requires explicit confirmation." });
+      return;
+    }
+
+    if (action === "execute_command") {
+      const command = message.toLowerCase().trim();
+      const commandMap = {
+        "maintenance on": "maintenance_on", "maintenance off": "maintenance_off",
+        "event on": "owner_event_on", "event off": "owner_event_off",
+        "leaderboard freeze": "leaderboard_freeze", "leaderboard unfreeze": "leaderboard_unfreeze",
+        "economy freeze": "economy_freeze", "economy unfreeze": "economy_unfreeze"
+      };
+      if (!Object.prototype.hasOwnProperty.call(commandMap, command)) {
+        auditSecurityEvent("owner_command_rejected", auth.session, { command });
+        sendJson(res, 400, { ok: false, message: "Unknown safe owner command." });
+        return;
+      }
+      action = commandMap[command];
+    }
+
+    const ownerId = accountOnlineId(auth.session);
+    if (target && target === ownerId && ["kick_player", "ban_player", "mute_player", "force_logout", "eliminate_player"].includes(action)) {
+      auditSecurityEvent("owner_self_moderation_blocked", auth.session, { action });
+      sendJson(res, 403, { ok: false, message: "Protected owner account cannot be moderated." });
+      return;
+    }
+
+    let persistentChange = false;
+    let modifiedRun = true;
+    let changed = true;
+    const numericValue = boundedInt(value, 0, 100000000, 0);
+    const targetSocket = target ? onlineSocketForPlayer(target) : null;
+    let affectedRooms = [];
+    if (target && rooms.has(target)) affectedRooms = [rooms.get(target)];
+    else if (targetSocket && targetSocket.roomCode && rooms.has(targetSocket.roomCode)) affectedRooms = [rooms.get(targetSocket.roomCode)];
+    else if (action.startsWith("event_") || action.startsWith("mass_reward") || ["owner_event_on", "owner_event_off", "emergency_lockdown", "end_lockdown"].includes(action)) affectedRooms = Array.from(rooms.values());
+
+    if (["give_coins", "remove_coins", "daily_compensation"].includes(action)) {
+      if (!target) { sendJson(res, 400, { ok: false, message: "Target player required." }); return; }
+      await ensureCloudSavesLoaded();
+      const profile = securityProfileFor(target);
+      const amount = action === "daily_compensation" ? Math.max(1, numericValue || 1000) : Math.max(1, numericValue);
+      profile.coins = boundedInt(profile.coins + (action === "remove_coins" ? -amount : amount), 0, 100000000, profile.coins);
+      profile.updated_at = new Date().toISOString();
+      storeSecurityProfile(target, profile);
+      persistentChange = true;
+    } else if (["give_skin", "remove_skin", "give_all_skins"].includes(action)) {
+      if (!target) { sendJson(res, 400, { ok: false, message: "Target player required." }); return; }
+      await ensureCloudSavesLoaded();
+      const profile = securityProfileFor(target);
+      if (action === "give_all_skins") {
+        profile.player_skin_owned_mask = 1023;
+        profile.rainbow_skin_unlocked = true;
+      } else {
+        const skinId = boundedInt(value, 0, 9, -1);
+        if (skinId < 0 || (action === "remove_skin" && skinId === 0)) { sendJson(res, 400, { ok: false, message: "Valid removable skin ID required." }); return; }
+        if (action === "give_skin") profile.player_skin_owned_mask |= (1 << skinId);
+        else profile.player_skin_owned_mask &= ~(1 << skinId);
+        if (skinId === 8) profile.rainbow_skin_unlocked = action === "give_skin";
+      }
+      profile.updated_at = new Date().toISOString();
+      storeSecurityProfile(target, profile);
+      persistentChange = true;
+    } else if (action === "warn_player") {
+      if (!target || !message) { sendJson(res, 400, { ok: false, message: "Target and reason required." }); return; }
+      const warnings = warningsByPlayer.get(target) || [];
+      warnings.unshift({ reason: message, created_at: new Date().toISOString(), admin_id: ownerId });
+      warningsByPlayer.set(target, warnings.slice(0, 50));
+      persistentChange = true;
+    } else if (action === "mute_player") {
+      if (!target) { sendJson(res, 400, { ok: false, message: "Target required." }); return; }
+      mutesByPlayer.set(target, { reason: message || "Owner moderation", created_at: new Date().toISOString() });
+      persistentChange = true;
+    } else if (action === "ban_player") {
+      if (!target) { sendJson(res, 400, { ok: false, message: "Target required." }); return; }
+      bannedPlayers.set(`ID:${target}`, { player_id: target, player_name: adminPlayerProfile(target)?.player_name || target, reason: message || "Owner ban", owner_id: ownerId, created_at: new Date().toISOString(), expires_at: "" });
+      disconnectPlayer(target, message || "Owner ban");
+      invalidatePlayerSessions(target);
+      persistentChange = true;
+    } else if (action === "unban_player") {
+      changed = removePlayerBan(target);
+      persistentChange = true;
+    } else if (action === "kick_player") {
+      changed = disconnectPlayer(target, message || "Owner kick");
+    } else if (action === "force_logout") {
+      changed = invalidatePlayerSessions(target) > 0;
+      disconnectPlayer(target, message || "Owner force logout");
+    } else if (["mark_suspicious", "leaderboard_suspicious", "block_suspicious_economy"].includes(action)) {
+      if (!target) { sendJson(res, 400, { ok: false, message: "Target required." }); return; }
+      shadowBans.add(target);
+      persistentChange = true;
+    } else if (action === "leaderboard_soft_ban") {
+      leaderboardSoftBans.add(target);
+      persistentChange = true;
+    } else if (action === "leaderboard_unban") {
+      changed = leaderboardSoftBans.delete(target);
+      persistentChange = true;
+    } else if (action === "owner_note") {
+      adminState.notes.unshift(adminRecord("owner_note", { player_id: target, message }, auth.session));
+      adminState.notes.length = Math.min(adminState.notes.length, ADMIN_COLLECTION_LIMITS.notes);
+      persistentChange = true;
+      modifiedRun = false;
+    } else if (action === "beta_grant" || action === "beta_remove") {
+      const accountId = cleanAdminText(value || target, 160);
+      if (!accountId) { sendJson(res, 400, { ok: false, message: "Account ID required." }); return; }
+      if (action === "beta_grant" && !adminState.beta_testers.some((entry) => entry.account_id === accountId)) adminState.beta_testers.unshift(adminRecord("beta_tester", { account_id: accountId }, auth.session));
+      if (action === "beta_remove") adminState.beta_testers = adminState.beta_testers.filter((entry) => entry.account_id !== accountId);
+      adminState.beta_testers.length = Math.min(adminState.beta_testers.length, ADMIN_COLLECTION_LIMITS.beta_testers);
+      persistentChange = true;
+      modifiedRun = false;
+    } else {
+      const flagActions = {
+        owner_event_on: ["owner_event_mode", true], owner_event_off: ["owner_event_mode", false],
+        leaderboard_freeze: ["leaderboard_frozen", true], leaderboard_unfreeze: ["leaderboard_frozen", false],
+        economy_freeze: ["economy_frozen", true], economy_unfreeze: ["economy_frozen", false],
+        shop_disable: ["shop_enabled", false], shop_enable: ["shop_enabled", true],
+        online_disable: ["online_enabled", false], online_enable: ["online_enabled", true],
+        beta_mode_on: ["beta_mode", true], beta_mode_off: ["beta_mode", false],
+        force_update_on: ["force_update", true], force_update_off: ["force_update", false]
+      };
+      if (Object.prototype.hasOwnProperty.call(flagActions, action)) {
+        const [key, enabled] = flagActions[action];
+        adminState[key] = enabled;
+        persistentChange = true;
+        modifiedRun = !["leaderboard_frozen", "economy_frozen", "shop_enabled", "online_enabled", "beta_mode", "force_update"].includes(key);
+      } else if (action === "maintenance_on" || action === "maintenance_off" || action === "emergency_lockdown" || action === "end_lockdown") {
+        const enabled = action === "maintenance_on" || action === "emergency_lockdown";
+        adminState.maintenance = { enabled, message: message || (enabled ? "Owner maintenance is active." : "Online"), updated_at: new Date().toISOString() };
+        if (action === "emergency_lockdown") adminState.online_enabled = false;
+        if (action === "end_lockdown") adminState.online_enabled = true;
+        persistentChange = true;
+        modifiedRun = false;
+      }
+    }
+
+    if (targetSocket) {
+      send(targetSocket, { cmd: "owner_action", action, value, message, admin_modified: modifiedRun });
+      if (targetSocket.roomCode && rooms.has(targetSocket.roomCode) && !affectedRooms.includes(rooms.get(targetSocket.roomCode))) affectedRooms.push(rooms.get(targetSocket.roomCode));
+    }
+    for (const room of affectedRooms) {
+      room.adminModified = true;
+      broadcastRoom(room, { cmd: "owner_action", action, target, value, message, admin_modified: true });
+      broadcastSpectators(room, { cmd: "owner_action", action, target, value, message, admin_modified: true });
+    }
+    if (modifiedRun) {
+      for (const session of scoreSessions.values()) {
+        if (!target || session.playerId === target || affectedRooms.some((room) => room.slotOnlineIds && room.slotOnlineIds.includes(session.playerId))) session.adminModified = true;
+      }
+    }
+
+    auditSecurityEvent("owner_action", auth.session, { action, target, value, message, changed, affected_rooms: affectedRooms.map((room) => room.code), admin_modified: modifiedRun });
+    if (persistentChange) {
+      try { await persistCloudSaves(); } catch (error) { sendStorageError(res, error, "Owner action"); return; }
+    }
+    sendJson(res, 200, { ok: true, message: `Owner action ${action} completed.`, action, changed, admin_modified: modifiedRun });
+    return;
+  }
+
+
   if (url.pathname === "/admin/audit/log" || url.pathname === "/admin/audit/list") {
     const auth = requireRequestPermission(req, res, "can_view_audit_log");
     if (!auth) return;
@@ -3189,9 +3444,9 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 403, { ok: false, message: "Online runs are disabled for this account." });
       return;
     }
-    if (body.debug_build === true || body.bot_mode === true || body.test_mode === true) {
+    if (body.debug_build === true || body.bot_mode === true || body.test_mode === true || body.admin_modified === true) {
       recordSecurityReport("debug_or_bot_run", auth, { debug_build: body.debug_build === true, bot_mode: body.bot_mode === true, test_mode: body.test_mode === true });
-      sendJson(res, 403, { ok: false, message: "Debug, bot and test runs cannot use public leaderboards." });
+      sendJson(res, 403, { ok: false, message: "Debug, bot, test and owner-modified runs cannot use public leaderboards." });
       return;
     }
     const token = makeToken();
@@ -3208,6 +3463,7 @@ const server = http.createServer(async (req, res) => {
       summary: null,
       submissions: 0,
       uploads: new Set()
+      ,adminModified: false
     });
     const createdSession = scoreSessions.get(token);
     sendJson(res, 201, {
@@ -3236,6 +3492,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 409, { ok: false, message: "Run is not running." });
       return;
     }
+    if (body.admin_modified === true) session.adminModified = true;
     const next = {
       run_score: body.run_score,
       run_wave: body.run_wave,
@@ -3274,6 +3531,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 401, { ok: false, message: "Secure run is missing or belongs to another account." });
       return;
     }
+    if (body.admin_modified === true) session.adminModified = true;
     if (session.state === "ended" || session.state === "submitted") {
       sendJson(res, 200, { ok: true, run_id: session.runId, run_state: session.state, duplicate: true, summary: session.summary });
       return;
@@ -3333,6 +3591,12 @@ const server = http.createServer(async (req, res) => {
     if (activeBanForAuth(auth) || leaderboardSoftBans.has(auth.playerId)) {
       recordSecurityReport("blocked_leaderboard_upload", auth, { run_id: session.runId });
       sendJson(res, 403, { ok: false, message: "Leaderboard upload is disabled for this account." });
+      return;
+    }
+
+    if (adminState.leaderboard_frozen || session.adminModified === true || body.admin_modified === true) {
+      recordSecurityReport("blocked_admin_modified_upload", auth, { run_id: session.runId, leaderboard_frozen: adminState.leaderboard_frozen });
+      sendJson(res, 403, { ok: false, message: "Public leaderboard upload blocked for owner/admin modified run." });
       return;
     }
 
