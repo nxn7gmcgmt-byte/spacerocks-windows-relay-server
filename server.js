@@ -15,15 +15,15 @@ const REPLAY_MAX_FRAMES = 1800;
 const MAX_SPECTATORS_PER_MATCH = 32;
 const MAX_TEAM_SIZE = 100;
 const MAX_PLAYERS = 200;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.8";
-const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.8";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.15";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.15";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const GITHUB_OWNER = process.env.SPACEROCKS_GITHUB_OWNER || "nxn7gmcgmt-byte";
 const GITHUB_REPO = process.env.SPACEROCKS_GITHUB_REPO || "SpaceRocks";
 const GITHUB_TOKEN = process.env.SPACEROCKS_GITHUB_TOKEN || process.env.GITHUB_TOKEN || "";
 const RELEASE_TAG = process.env.SPACEROCKS_RELEASE_TAG || `v${LATEST_VERSION}`;
-const DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_DOWNLOAD_ASSET_NAME || `SpaceRocks-v${LATEST_VERSION}-windows.zip`;
+const DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_DOWNLOAD_ASSET_NAME || `Gameboy-v${LATEST_VERSION}-windows.zip`;
 let ACTIVE_LATEST_VERSION = LATEST_VERSION;
 let ACTIVE_MIN_CLIENT_VERSION = MIN_CLIENT_VERSION;
 let ACTIVE_RELEASE_TAG = RELEASE_TAG;
@@ -34,6 +34,8 @@ const OWNER_PLAYER_ID = String(process.env.SPACEROCKS_OWNER_PLAYER_ID || "").toU
 const OWNER_ACCOUNT = String(process.env.SPACEROCKS_OWNER_ACCOUNT || "").toLowerCase();
 const OWNER_GOOGLE_SUB = String(process.env.SPACEROCKS_OWNER_GOOGLE_SUB || "").trim();
 const OWNER_GITHUB_ID = String(process.env.SPACEROCKS_OWNER_GITHUB_ID || "").trim();
+const OWNER_DISCORD_ID = String(process.env.SPACEROCKS_OWNER_DISCORD_ID || "").trim();
+const OWNER_STEAM_ID64 = String(process.env.SPACEROCKS_OWNER_STEAM_ID64 || "").trim();
 // Owner access is bound only to stable OAuth provider IDs stored on the backend.
 // Enable MFA on Google and GitHub, never share tokens, and never place OAuth secrets in GameMaker.
 const SEEDED_BANS = process.env.SPACEROCKS_BANNED_PLAYERS || "";
@@ -103,6 +105,7 @@ const MAX_CLOUD_DATA_KEYS = 180;
 const MAX_AUDIT_ENTRIES = 300;
 const MAX_SECURITY_REPORTS = 150;
 const ADMIN_COLLECTION_LIMITS = Object.freeze({ events: 40, announcements: 40, beta_testers: 200, appeals: 120, notes: 180 });
+const RESERVED_USERNAMES = new Set(["owner", "admin", "moderator", "helper", "support", "dev", "developer", "spacerocks", "gameboy", "system", "official", "lootlocker", "github", "google", "discord", "steam"]);
 
 const rooms = new Map();
 const scoreSessions = new Map();
@@ -126,7 +129,7 @@ const securityAuditLog = [];
 const warningsByPlayer = new Map();
 const mutesByPlayer = new Map();
 const adminState = {
-  maintenance: { enabled: false, message: "SpaceRocks wird gerade gewartet.", updated_at: "" },
+  maintenance: { enabled: false, message: "Gameboy wird gerade gewartet.", updated_at: "" },
   owner_event_mode: false,
   leaderboard_frozen: false,
   economy_frozen: false,
@@ -147,7 +150,7 @@ const serverNews = [
     created_at: new Date().toISOString()
   },
   {
-    title: "SpaceRocks Online v1.0.8",
+    title: "Gameboy Online",
     text: "Revanche-Abstimmung, sichere Disconnects und Owner-Rang sind online.",
     created_at: new Date().toISOString()
   },
@@ -270,6 +273,9 @@ function normalizeCloudSaveRecord(playerId, rawSave) {
   return {
     player_id: safeId,
     player_name: sanitizeName(source.player_name || safeId),
+    username: String(source.username || "").slice(0, 10),
+    username_normalized: String(source.username_normalized || "").toLowerCase().slice(0, 10),
+    linked_providers: Array.isArray(source.linked_providers) ? source.linked_providers.filter((item) => item && item.provider && item.provider_id).slice(0, 12) : [],
     account_id: String(source.account_id || "").slice(0, 160),
     data: applySecurityProfile(compactCloudData(source.data), profile),
     server_security: profile,
@@ -582,7 +588,7 @@ function publicDownloadUrl(req) {
 function githubHeaders(accept) {
   const headers = {
     "Accept": accept || "application/vnd.github+json",
-    "User-Agent": "SpaceRocksRelay"
+    "User-Agent": "GameboyRelay"
   };
   if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
   return headers;
@@ -610,7 +616,7 @@ async function githubReleaseForTag(tag) {
 function launcherReleaseFallback(req) {
   return {
     tag_name: ACTIVE_RELEASE_TAG,
-    name: `SpaceRocks ${ACTIVE_RELEASE_TAG}`,
+    name: `Gameboy ${ACTIVE_RELEASE_TAG}`,
     body: "Private GitHub Release. Download laeuft ueber den Render-Server.",
     html_url: RELEASE_URL,
     private_release_proxy: true,
@@ -632,7 +638,7 @@ async function launcherReleasePayload(req) {
     const assets = Array.isArray(release.assets) ? release.assets : [];
     return {
       tag_name: tag,
-      name: release.name || `SpaceRocks ${tag}`,
+      name: release.name || `Gameboy ${tag}`,
       body: release.body || "",
       html_url: release.html_url || RELEASE_URL,
       private_release_proxy: USE_RELEASE_PROXY,
@@ -658,13 +664,13 @@ async function refreshActiveRelease() {
     const tag = String(release.tag_name || "").trim();
     const version = tag.replace(/^v/i, "");
     const assets = Array.isArray(release.assets) ? release.assets : [];
-    const preferredName = `SpaceRocks-v${version}-windows.zip`.toLowerCase();
+    const preferredName = `Gameboy-v${version}-windows.zip`.toLowerCase();
     const asset = assets.find((item) => String(item.name || "").toLowerCase() === preferredName)
       || assets.find((item) => String(item.name || "").toLowerCase().includes("windows") && String(item.name || "").toLowerCase().endsWith(".zip"));
     if (tag && version && asset && compareVersion(version, ACTIVE_LATEST_VERSION) >= 0) {
       ACTIVE_RELEASE_TAG = tag;
       ACTIVE_LATEST_VERSION = version;
-      ACTIVE_DOWNLOAD_ASSET_NAME = String(asset.name || `SpaceRocks-v${version}-windows.zip`);
+      ACTIVE_DOWNLOAD_ASSET_NAME = String(asset.name || `Gameboy-v${version}-windows.zip`);
       console.log(`[UPDATE] active release ${ACTIVE_RELEASE_TAG} asset=${ACTIVE_DOWNLOAD_ASSET_NAME}`);
     }
   } catch (error) {
@@ -816,7 +822,7 @@ const ROLE_PERMISSIONS = Object.freeze({
 });
 
 function ownerIdentityConfigured() {
-  return Boolean(OWNER_GOOGLE_SUB || OWNER_GITHUB_ID);
+  return Boolean(OWNER_GOOGLE_SUB || OWNER_GITHUB_ID || OWNER_DISCORD_ID || OWNER_STEAM_ID64);
 }
 
 function ownerSessionMatches(session) {
@@ -825,6 +831,8 @@ function ownerSessionMatches(session) {
   const providerId = String(session.provider_id || "").trim();
   if (provider === "google" && OWNER_GOOGLE_SUB) return providerId === OWNER_GOOGLE_SUB;
   if (provider === "github" && OWNER_GITHUB_ID) return providerId === OWNER_GITHUB_ID;
+  if (provider === "discord" && OWNER_DISCORD_ID) return providerId === OWNER_DISCORD_ID;
+  if (provider === "steam" && OWNER_STEAM_ID64) return providerId === OWNER_STEAM_ID64;
   return false;
 }
 
@@ -845,13 +853,20 @@ function sessionHasPermission(session, permission) {
 
 function publicRoleResponse(session) {
   const role = roleForSession(session);
+  const playerId = accountOnlineId(session);
+  const savedAccount = cloudSaves.get(playerId) || null;
+  const username = savedAccount ? String(savedAccount.username || "") : "";
   return {
     account: {
       provider: String(session.provider || ""),
       provider_id: String(session.provider_id || ""),
       account_id: String(session.account_id || ""),
       email: String(session.email || ""),
-      name: String(session.name || "SPIELER")
+      name: username || String(session.name || "SPIELER"),
+      username,
+      username_required: username.length < 3,
+      account_user_id: playerId,
+      linked_providers: savedAccount && Array.isArray(savedAccount.linked_providers) ? savedAccount.linked_providers.map((item) => item.provider) : []
     },
     role,
     is_owner: role === "owner",
@@ -859,6 +874,26 @@ function publicRoleResponse(session) {
     session_expires_at: Number(session.expiresAt || (session.createdAt + AUTH_SESSION_TTL_MS)),
     recheck_after_seconds: ADMIN_RECHECK_SECONDS
   };
+}
+
+function normalizeUsername(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function usernameValidationError(value) {
+  const username = String(value || "").trim();
+  const normalized = normalizeUsername(username);
+  if (username.length < 3 || username.length > 10) return "Username must contain 3 to 10 characters.";
+  if (!/^[A-Za-z0-9_]+$/.test(username)) return "Username may only use letters, numbers and underscore.";
+  if (RESERVED_USERNAMES.has(normalized)) return "This username is reserved.";
+  return "";
+}
+
+function usernameOwner(normalized) {
+  for (const [playerId, save] of cloudSaves.entries()) {
+    if (save && String(save.username_normalized || "") === normalized) return playerId;
+  }
+  return "";
 }
 
 function ownerAccountMatches(ws) {
@@ -903,9 +938,19 @@ function authSessionForToken(token) {
 
 function accountOnlineId(session) {
   if (!session) return "";
+  if (session.linked_account_user_id) return sanitizeId(session.linked_account_user_id);
+  const providerAccountId = linkedProviderAccountId(session);
+  for (const [playerId, save] of cloudSaves.entries()) {
+    if (save && Array.isArray(save.linked_providers) && save.linked_providers.some((item) => linkedProviderAccountId(item) === providerAccountId)) return playerId;
+  }
   const prefixes = { google: "G", apple: "A", github: "H", discord: "D", microsoft: "X", twitch: "T", opera_gx: "O", itchio: "I", steam: "S", roblox: "R", epic: "E", playstation: "P", nintendo: "N" };
   const prefix = prefixes[String(session.provider || "").toLowerCase()] || "U";
   return sanitizeId(`${prefix}${session.provider_id || session.account_id}`);
+}
+
+function linkedProviderAccountId(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return String(source.account_id || `${source.provider || ""}:${source.provider_id || ""}`);
 }
 
 function requestAuthContext(req, requestedPlayerId = "") {
@@ -920,6 +965,13 @@ function requestAuthContext(req, requestedPlayerId = "") {
 function requireRequestAuth(req, res, requestedPlayerId = "") {
   const context = requestAuthContext(req, requestedPlayerId);
   if (context) return context;
+  sendJson(res, 401, { ok: false, message: "Bitte zuerst mit einem verfuegbaren Kontoanbieter anmelden." });
+  return null;
+}
+
+function requireAccountAuth(req, res) {
+  const context = requestAuthContext(req);
+  if (context && context.session) return context;
   sendJson(res, 401, { ok: false, message: "Bitte zuerst mit einem verfuegbaren Kontoanbieter anmelden." });
   return null;
 }
@@ -965,7 +1017,7 @@ function authenticateSocket(ws, msg) {
     ws.accountId = ws.onlineId || "guest";
     return true;
   }
-  send(ws, { cmd: "auth_required", message: "Bitte zuerst mit einem verfuegbaren SpaceRocks-Kontoanbieter anmelden." });
+  send(ws, { cmd: "auth_required", message: "Bitte zuerst mit einem verfuegbaren Gameboy-Kontoanbieter anmelden." });
   return false;
 }
 
@@ -1178,7 +1230,7 @@ async function exchangeGithubCode(code, redirectUri) {
   const githubHeaders = {
     "Accept": "application/vnd.github+json",
     "Authorization": `Bearer ${tokenData.access_token}`,
-    "User-Agent": "SpaceRocks-Login",
+    "User-Agent": "Gameboy-Login",
     "X-GitHub-Api-Version": "2022-11-28"
   };
   const profileResponse = await fetch("https://api.github.com/user", { headers: githubHeaders });
@@ -1314,7 +1366,7 @@ function cloudGithubHeaders() {
   return {
     "Accept": "application/vnd.github+json",
     "Authorization": `Bearer ${GITHUB_TOKEN}`,
-    "User-Agent": "SpaceRocks-Cloud-Save",
+    "User-Agent": "Gameboy-Cloud-Save",
     "X-GitHub-Api-Version": "2022-11-28"
   };
 }
@@ -1378,7 +1430,7 @@ async function loadCloudSavesNow() {
   if (storedAdmin.maintenance && typeof storedAdmin.maintenance === "object") {
     adminState.maintenance = {
       enabled: storedAdmin.maintenance.enabled === true,
-      message: String(storedAdmin.maintenance.message || "SpaceRocks wird gerade gewartet.").slice(0, 240),
+      message: String(storedAdmin.maintenance.message || "Gameboy wird gerade gewartet.").slice(0, 240),
       updated_at: String(storedAdmin.maintenance.updated_at || "")
     };
   }
@@ -1455,7 +1507,7 @@ async function persistCloudSavesNow() {
     }
 
     const body = {
-      message: "Update SpaceRocks account cloud saves",
+      message: "Update Gameboy account cloud saves",
       content: Buffer.from(JSON.stringify(stats.payload)).toString("base64"),
       branch: CLOUD_GITHUB_BRANCH
     };
@@ -1808,7 +1860,7 @@ function clientVersionOk(version) {
 function rejectOldClient(ws) {
   send(ws, {
     cmd: "update_required",
-    message: `Bitte update SpaceRocks auf ${ACTIVE_LATEST_VERSION}.`,
+    message: `Bitte update Gameboy auf ${ACTIVE_LATEST_VERSION}.`,
     latest_version: ACTIVE_LATEST_VERSION,
     min_version: ACTIVE_MIN_CLIENT_VERSION,
     release_url: RELEASE_URL,
@@ -1824,7 +1876,7 @@ function allowOnlineEntry(ws, msg) {
   if (!authenticateSocket(ws, msg)) return false;
   const authenticatedSession = authSessionForToken(msg && msg.auth_token);
   if (adminState.maintenance.enabled && roleForSession(authenticatedSession) !== "owner") {
-    send(ws, { cmd: "maintenance", message: adminState.maintenance.message || "SpaceRocks wird gerade gewartet." });
+    send(ws, { cmd: "maintenance", message: adminState.maintenance.message || "Gameboy wird gerade gewartet." });
     return false;
   }
   if (rejectBannedConnection(ws, msg)) return false;
@@ -2420,8 +2472,16 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  if (url.pathname === "/auth/start" || url.pathname === "/auth/login-google" || url.pathname === "/auth/login-github") {
+  if (url.pathname === "/auth/start" || url.pathname === "/auth/login-google" || url.pathname === "/auth/login-github" || url.pathname === "/account/providers/link") {
     cleanAuthState();
+    let linkAuth = null;
+    if (url.pathname === "/account/providers/link") {
+      linkAuth = requireAccountAuth(req, res);
+      if (!linkAuth) return;
+      try { await ensureCloudSavesLoaded(); }
+      catch { sendJson(res, 503, { ok: false, message: "Account storage unavailable." }); return; }
+      linkAuth.playerId = accountOnlineId(linkAuth.session);
+    }
     const provider = url.pathname === "/auth/login-google"
       ? "google"
       : url.pathname === "/auth/login-github"
@@ -2433,7 +2493,7 @@ const server = http.createServer(async (req, res) => {
     }
     const state = makeToken();
     const redirectUri = `${serverOrigin(req)}/auth/callback/${provider}${provider === "steam" ? `?state=${encodeURIComponent(state)}` : ""}`;
-    authRequests.set(state, { provider, status: "pending", createdAt: Date.now(), redirectUri });
+    authRequests.set(state, { provider, status: "pending", createdAt: Date.now(), redirectUri, linkAccountUserId:linkAuth ? linkAuth.playerId : "" });
 
     if (provider === "steam") {
       const steamUrl = new URL("https://steamcommunity.com/openid/login");
@@ -2493,7 +2553,7 @@ const server = http.createServer(async (req, res) => {
     const state = String(callbackParams.get("state") || "");
     const code = String(callbackParams.get("code") || "");
     const request = authRequests.get(state);
-    let title = "SpaceRocks Login fehlgeschlagen";
+    let title = "Gameboy Login fehlgeschlagen";
     let message = "Die Anmeldung konnte nicht abgeschlossen werden.";
 
     if (request && (code || request.provider === "steam")) {
@@ -2504,6 +2564,23 @@ const server = http.createServer(async (req, res) => {
         else if (request.provider === "google") account = await exchangeGoogleCode(code, request.redirectUri);
         else if (request.provider === "steam") account = await exchangeSteamOpenId(callbackParams);
         else account = await exchangeGenericOAuthCode(request.provider, code, request.redirectUri, genericOAuthConfig(request.provider));
+        if (request.linkAccountUserId) {
+          await ensureCloudSavesLoaded();
+          let alreadyLinkedTo = "";
+          for (const [playerId, save] of cloudSaves.entries()) {
+            if (save && Array.isArray(save.linked_providers) && save.linked_providers.some((item) => linkedProviderAccountId(item) === linkedProviderAccountId(account))) alreadyLinkedTo = playerId;
+          }
+          if (alreadyLinkedTo && alreadyLinkedTo !== request.linkAccountUserId) throw new Error("This provider is already linked to another Gameboy account.");
+          const targetSave = cloudSaves.get(request.linkAccountUserId);
+          if (!targetSave) throw new Error("Gameboy account profile was not found.");
+          if (!Array.isArray(targetSave.linked_providers)) targetSave.linked_providers = [];
+          if (!targetSave.linked_providers.some((item) => linkedProviderAccountId(item) === linkedProviderAccountId(account))) {
+            targetSave.linked_providers.push({ provider:account.provider, provider_id:account.provider_id, account_id:account.account_id, linked_at:new Date().toISOString() });
+          }
+          account.linked_account_user_id = request.linkAccountUserId;
+          await persistCloudSaves();
+          auditSecurityEvent("account_provider_linked", account, { account_user_id:request.linkAccountUserId, provider:account.provider });
+        }
         const sessionToken = issueAuthSession(account);
         request.status = "complete";
         request.sessionToken = sessionToken;
@@ -2512,8 +2589,8 @@ const server = http.createServer(async (req, res) => {
         auditSecurityEvent(ownerSessionMatches(account) ? "owner_login_success" : "account_login_success", account, {
           provider: request.provider
         });
-        title = "SpaceRocks Login erfolgreich";
-        message = "Du kannst dieses Fenster schliessen und zu SpaceRocks zurueckkehren.";
+        title = "Gameboy Login erfolgreich";
+        message = "Du kannst dieses Fenster schliessen und zu Gameboy zurueckkehren.";
       } catch (error) {
         request.status = "error";
         request.message = error.message || "Google Login fehlgeschlagen.";
@@ -2527,15 +2604,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/auth/me" || url.pathname === "/auth/current-user") {
-    const auth = requireRequestAuth(req, res);
-    if (!auth || !auth.session) return;
+    const auth = requireAccountAuth(req, res);
+    if (!auth) return;
+    try { await ensureCloudSavesLoaded(); } catch { sendJson(res, 503, { ok: false, message: "Account storage unavailable." }); return; }
     sendJson(res, 200, { ok: true, ...publicRoleResponse(auth.session) });
     return;
   }
 
   if (url.pathname === "/auth/check-role" || url.pathname === "/auth/check-owner") {
-    const auth = requireRequestAuth(req, res);
-    if (!auth || !auth.session) return;
+    const auth = requireAccountAuth(req, res);
+    if (!auth) return;
     try { await ensureCloudSavesLoaded(); } catch (error) {
       auditSecurityEvent("backend_validation_failure", auth.session, { endpoint: url.pathname });
       sendJson(res, 503, { ok: false, message: "Role storage unavailable." });
@@ -2609,6 +2687,98 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/account/providers/list" || url.pathname === "/account/providers/check") {
+    const auth = requireAccountAuth(req, res);
+    if (!auth) return;
+    try { await ensureCloudSavesLoaded(); } catch { sendJson(res, 503, { ok: false, message: "Account storage unavailable." }); return; }
+    auth.playerId = accountOnlineId(auth.session);
+    const save = cloudSaves.get(auth.playerId) || null;
+    const linked = save && Array.isArray(save.linked_providers) ? save.linked_providers.map((item) => ({ provider:item.provider, linked_at:item.linked_at || "" })) : [];
+    if (url.pathname.endsWith("/check")) {
+      const provider = String(url.searchParams.get("provider") || "").toLowerCase();
+      sendJson(res, 200, { ok: true, provider, linked: linked.some((item) => item.provider === provider) });
+    } else {
+      sendJson(res, 200, { ok: true, account_user_id:auth.playerId, providers:linked });
+    }
+    return;
+  }
+
+  if (url.pathname === "/account/providers/unlink" && req.method === "POST") {
+    const auth = requireAccountAuth(req, res);
+    if (!auth) return;
+    const body = await readJson(req);
+    const provider = String(body.provider || "").toLowerCase();
+    try { await ensureCloudSavesLoaded(); } catch { sendJson(res, 503, { ok: false, message: "Account storage unavailable." }); return; }
+    auth.playerId = accountOnlineId(auth.session);
+    const save = cloudSaves.get(auth.playerId);
+    const linked = save && Array.isArray(save.linked_providers) ? save.linked_providers : [];
+    if (!save || linked.length <= 1 || provider === String(auth.session.provider || "")) {
+      sendJson(res, 400, { ok:false, message:"Keep at least one login method and unlink from a different provider session." });
+      return;
+    }
+    const before = linked.length;
+    save.linked_providers = linked.filter((item) => item.provider !== provider);
+    if (save.linked_providers.length === before) { sendJson(res, 404, { ok:false, message:"Provider is not linked." }); return; }
+    auditSecurityEvent("account_provider_unlinked", auth.session, { account_user_id:auth.playerId, provider });
+    try { await persistCloudSaves(); } catch (error) { sendStorageError(res, error, "Provider link"); return; }
+    sendJson(res, 200, { ok:true, provider, providers:save.linked_providers.map((item) => ({provider:item.provider, linked_at:item.linked_at || ""})) });
+    return;
+  }
+
+
+  if (url.pathname === "/account/username/reserved-list" || url.pathname === "/account/username/blocked-list") {
+    if (!requireAccountAuth(req, res)) return;
+    sendJson(res, 200, { ok: true, usernames: Array.from(RESERVED_USERNAMES).sort() });
+    return;
+  }
+
+  if (url.pathname === "/account/username/check") {
+    const auth = requireAccountAuth(req, res);
+    if (!auth) return;
+    try { await ensureCloudSavesLoaded(); } catch { sendJson(res, 503, { ok: false, message: "Account storage unavailable." }); return; }
+    auth.playerId = accountOnlineId(auth.session);
+    const username = String(url.searchParams.get("username") || "").trim();
+    const normalized = normalizeUsername(username);
+    const error = usernameValidationError(username);
+    const owner = error ? "" : usernameOwner(normalized);
+    sendJson(res, 200, { ok: true, available: !error && (!owner || owner === auth.playerId), message: error || (owner && owner !== auth.playerId ? "Username already taken." : "") });
+    return;
+  }
+
+  if ((url.pathname === "/account/username/set" || url.pathname === "/account/username/change") && req.method === "POST") {
+    const auth = requireAccountAuth(req, res);
+    if (!auth) return;
+    const body = await readJson(req);
+    const username = String(body.username || "").trim();
+    const normalized = normalizeUsername(username);
+    const error = usernameValidationError(username);
+    if (error) { sendJson(res, 400, { ok: false, message: error }); return; }
+    try { await ensureCloudSavesLoaded(); } catch { sendJson(res, 503, { ok: false, message: "Account storage unavailable." }); return; }
+    auth.playerId = accountOnlineId(auth.session);
+    const owner = usernameOwner(normalized);
+    if (owner && owner !== auth.playerId) { sendJson(res, 409, { ok: false, message: "Username already taken." }); return; }
+    const current = cloudSaves.get(auth.playerId) || normalizeCloudSaveRecord(auth.playerId, {
+      player_id: auth.playerId, player_name: username, account_id: String(auth.session.account_id || ""), data: {}
+    });
+    current.player_name = username;
+    current.username = username;
+    current.username_normalized = normalized;
+    current.account_id = String(auth.session.account_id || current.account_id || "");
+    if (!Array.isArray(current.linked_providers)) current.linked_providers = [];
+    if (!current.linked_providers.some((item) => String(item.account_id || "") === String(auth.session.account_id || ""))) {
+      current.linked_providers.push({ provider:String(auth.session.provider || ""), provider_id:String(auth.session.provider_id || ""), account_id:String(auth.session.account_id || ""), linked_at:new Date().toISOString() });
+    }
+    current.updated_at = new Date().toISOString();
+    cloudSaves.set(auth.playerId, current);
+    auth.session.name = username;
+    auditSecurityEvent(url.pathname.endsWith("/change") ? "account_username_changed" : "account_username_set", auth.session, { account_user_id: auth.playerId, username });
+    try { await persistCloudSaves(); }
+    catch (storageError) { sendStorageError(res, storageError, "Username"); return; }
+    sendJson(res, 200, { ok: true, account_user_id: auth.playerId, username });
+    return;
+  }
+
+
   if (url.pathname === "/owner/state") {
     const auth = requireOwnerRequest(req, res);
     if (!auth) return;
@@ -2642,30 +2812,22 @@ const server = http.createServer(async (req, res) => {
     if (!auth) return;
     const body = await readJson(req);
     let action = String(body.action || "").toLowerCase().trim().slice(0, 60);
-    const target = sanitizeId(body.target);
+    try { await ensureCloudSavesLoaded(); } catch { sendJson(res, 503, { ok:false, message:"Owner storage unavailable." }); return; }
+    const rawTarget = String(body.target || "").trim();
+    const usernameTarget = knownPlayerRecords().find((player) => String(player.player_name || "").toLowerCase() === rawTarget.toLowerCase());
+    const target = usernameTarget ? usernameTarget.player_id : sanitizeId(rawTarget);
     const value = cleanAdminText(body.value, 80);
     const message = cleanAdminText(body.message, 240);
     const confirmed = body.confirmed === true;
     const supported = new Set([
-      "refresh", "spectate", "teleport_to", "teleport_here", "freeze_player", "unfreeze_player",
-      "respawn_player", "heal_player", "damage_player", "eliminate_player", "kick_player", "warn_player",
-      "mute_player", "ban_player", "unban_player", "force_logout", "mark_suspicious", "owner_note",
-      "start_match", "end_match", "restart_match", "pause_match", "resume_match", "force_rematch",
-      "balance_teams", "lock_lobby", "unlock_lobby", "close_lobby", "open_lobby", "set_match_timer",
-      "set_score_limit", "set_wave", "move_team", "event_meteor_storm", "event_asteroid_rain",
-      "event_black_hole", "event_gravity_well", "event_boss_asteroid", "event_enemy_wave",
-      "event_rare_pickup", "event_coin_rain", "event_rainbow", "event_explosion", "event_screen_shake",
-      "event_slow_motion", "event_speed_boost", "event_double_damage", "event_low_gravity", "event_chaos",
-      "event_sudden_death", "event_boss_rush", "event_laser_storm", "event_emp", "event_shield_bubble",
-      "event_random_powerup", "event_everyone_dash", "event_one_life", "event_arena_shrink",
-      "owner_event_on", "owner_event_off", "give_coins", "remove_coins", "daily_compensation",
-      "double_coins", "double_score", "beta_grant", "beta_remove", "mass_reward_online",
-      "mass_reward_lobby", "economy_freeze", "economy_unfreeze", "shop_disable", "shop_enable",
-      "sale_start", "sale_stop", "set_discount", "block_suspicious_economy", "give_skin",
-      "remove_skin", "give_all_skins", "leaderboard_freeze", "leaderboard_unfreeze",
-      "leaderboard_suspicious", "leaderboard_soft_ban", "leaderboard_unban", "emergency_lockdown",
-      "end_lockdown", "online_disable", "online_enable", "maintenance_on", "maintenance_off",
-      "force_update_on", "force_update_off", "beta_mode_on", "beta_mode_off", "execute_command"
+      "refresh", "set_wave", "kick_player", "warn_player", "mute_player", "ban_player", "unban_player",
+      "force_logout", "mark_suspicious", "owner_note", "give_coins", "remove_coins", "daily_compensation",
+      "beta_grant", "beta_remove", "economy_freeze", "economy_unfreeze", "shop_disable", "shop_enable",
+      "block_suspicious_economy", "give_skin", "remove_skin", "give_all_skins", "leaderboard_freeze",
+      "leaderboard_unfreeze", "leaderboard_suspicious", "leaderboard_soft_ban", "leaderboard_unban",
+      "owner_event_on", "owner_event_off", "emergency_lockdown", "end_lockdown", "online_disable",
+      "online_enable", "maintenance_on", "maintenance_off", "force_update_on", "force_update_off",
+      "beta_mode_on", "beta_mode_off", "execute_command"
     ]);
     if (!supported.has(action)) {
       auditSecurityEvent("owner_action_unsupported", auth.session, { action, target });
@@ -2714,7 +2876,36 @@ const server = http.createServer(async (req, res) => {
     else if (targetSocket && targetSocket.roomCode && rooms.has(targetSocket.roomCode)) affectedRooms = [rooms.get(targetSocket.roomCode)];
     else if (action.startsWith("event_") || action.startsWith("mass_reward") || ["owner_event_on", "owner_event_off", "emergency_lockdown", "end_lockdown"].includes(action)) affectedRooms = Array.from(rooms.values());
 
-    if (["give_coins", "remove_coins", "daily_compensation"].includes(action)) {
+    let ownerResult = {};
+    if (action === "set_wave") {
+      const parsedWave = Number(value);
+      if (!Number.isInteger(parsedWave) || parsedWave < 1 || parsedWave > 200) {
+        sendJson(res, 400, { ok: false, message: "Wave must be an integer from 1 to 200." });
+        return;
+      }
+      const effectiveTarget = target || auth.playerId;
+      let oldWave = 0;
+      let targetType = target && rooms.has(target) ? "lobby" : "player";
+      let targetId = effectiveTarget;
+      for (const session of scoreSessions.values()) {
+        if (session.runId === target || session.playerId === effectiveTarget) {
+          oldWave = Math.max(oldWave, Number(session.progress && session.progress.wave || 0));
+          session.progress.wave = parsedWave;
+          session.adminModified = true;
+          targetType = session.runId === target ? "run" : "player";
+          targetId = session.runId === target ? session.runId : effectiveTarget;
+        }
+      }
+      if (target && rooms.has(target)) {
+        const waveRoom = rooms.get(target);
+        oldWave = Math.max(oldWave, Number(waveRoom.ownerWave || 0));
+        waveRoom.ownerWave = parsedWave;
+        waveRoom.adminModified = true;
+        if (!affectedRooms.includes(waveRoom)) affectedRooms.push(waveRoom);
+      }
+      ownerResult = { old_wave: oldWave, new_wave: parsedWave, target_type: targetType, target_id: targetId };
+      auditSecurityEvent("owner_set_wave", auth.session, { old_wave: oldWave, new_wave: parsedWave, target_type: targetType, target_id: targetId, reason: message });
+    } else if (["give_coins", "remove_coins", "daily_compensation"].includes(action)) {
       if (!target) { sendJson(res, 400, { ok: false, message: "Target player required." }); return; }
       await ensureCloudSavesLoaded();
       const profile = securityProfileFor(target);
@@ -2831,7 +3022,10 @@ const server = http.createServer(async (req, res) => {
     if (persistentChange) {
       try { await persistCloudSaves(); } catch (error) { sendStorageError(res, error, "Owner action"); return; }
     }
-    sendJson(res, 200, { ok: true, message: `Owner action ${action} completed.`, action, changed, admin_modified: modifiedRun });
+    const successMessage = action === "set_wave"
+      ? `Wave set to ${ownerResult.new_wave}. This run is now admin-modified and cannot upload to public leaderboard.`
+      : `Owner action ${action} completed.`;
+    sendJson(res, 200, { ok: true, message: successMessage, action, changed, admin_modified: modifiedRun, ...ownerResult });
     return;
   }
 
@@ -3434,7 +3628,7 @@ const server = http.createServer(async (req, res) => {
     if (!clientVersionOk(gameVersion)) {
       sendJson(res, 426, {
         ok: false,
-        message: `SpaceRocks ${ACTIVE_MIN_CLIENT_VERSION} or newer is required.`,
+        message: `Gameboy ${ACTIVE_MIN_CLIENT_VERSION} or newer is required.`,
         min_client_version: ACTIVE_MIN_CLIENT_VERSION
       });
       return;
@@ -3906,7 +4100,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("SpaceRocks Windows Relay online");
+  res.end("Gameboy Windows Relay online");
 });
 
 const wss = new WebSocket.Server({ server });
@@ -4366,5 +4560,5 @@ setInterval(cleanupExpiredRooms, 30000);
 setInterval(cleanScoreSessions, 60000);
 
 server.listen(PORT, () => {
-  console.log(`SpaceRocks Windows relay listening on ${PORT}`);
+  console.log(`Gameboy Windows relay listening on ${PORT}`);
 });
