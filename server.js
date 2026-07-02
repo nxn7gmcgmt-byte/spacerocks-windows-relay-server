@@ -15,8 +15,8 @@ const REPLAY_MAX_FRAMES = 1800;
 const MAX_SPECTATORS_PER_MATCH = 32;
 const MAX_TEAM_SIZE = 100;
 const MAX_PLAYERS = 200;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.15";
-const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.15";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.16";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.16";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const GITHUB_OWNER = process.env.SPACEROCKS_GITHUB_OWNER || "nxn7gmcgmt-byte";
@@ -273,8 +273,8 @@ function normalizeCloudSaveRecord(playerId, rawSave) {
   return {
     player_id: safeId,
     player_name: sanitizeName(source.player_name || safeId),
-    username: String(source.username || "").slice(0, 10),
-    username_normalized: String(source.username_normalized || "").toLowerCase().slice(0, 10),
+    username: String(source.username || "").slice(0, 20),
+    username_normalized: String(source.username_normalized || "").toLowerCase().slice(0, 20),
     linked_providers: Array.isArray(source.linked_providers) ? source.linked_providers.filter((item) => item && item.provider && item.provider_id).slice(0, 12) : [],
     account_id: String(source.account_id || "").slice(0, 160),
     data: applySecurityProfile(compactCloudData(source.data), profile),
@@ -810,7 +810,7 @@ function sanitizeId(id) {
 }
 
 function sanitizeName(name) {
-  return String(name || "SPIELER").replace(/[^\w \-]/g, "").slice(0, 18) || "SPIELER";
+  return String(name || "SPIELER").replace(/[^\w \-]/g, "").slice(0, 20) || "SPIELER";
 }
 
 const ROLE_PERMISSIONS = Object.freeze({
@@ -883,7 +883,7 @@ function normalizeUsername(value) {
 function usernameValidationError(value) {
   const username = String(value || "").trim();
   const normalized = normalizeUsername(username);
-  if (username.length < 3 || username.length > 10) return "Username must contain 3 to 10 characters.";
+  if (username.length < 3 || username.length > 20) return "Username must contain 3 to 20 characters.";
   if (!/^[A-Za-z0-9_]+$/.test(username)) return "Username may only use letters, numbers and underscore.";
   if (RESERVED_USERNAMES.has(normalized)) return "This username is reserved.";
   return "";
