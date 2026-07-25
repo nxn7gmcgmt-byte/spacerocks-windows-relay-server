@@ -1,5 +1,7 @@
 const http = require("http");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { Readable } = require("stream");
 const WebSocket = require("ws");
 
@@ -29,11 +31,15 @@ const GITHUB_TOKEN = process.env.SPACEROCKS_GITHUB_TOKEN || process.env.GITHUB_T
 const RELEASE_TAG = process.env.SPACEROCKS_RELEASE_TAG || `v${LATEST_VERSION}`;
 const DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_DOWNLOAD_ASSET_NAME || `Gameboy-v${LATEST_VERSION}-windows.zip`;
 const ANDROID_DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_ANDROID_DOWNLOAD_ASSET_NAME || `Gameboy-v${LATEST_VERSION}-android.apk`;
+const HTML5_DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_HTML5_DOWNLOAD_ASSET_NAME || `Gameboy-v${LATEST_VERSION}-HTML5.zip`;
+const BROWSER_PLAY_URL = process.env.SPACEROCKS_BROWSER_PLAY_URL || "";
+const WEB_BUILD_DIR = path.join(__dirname, "public", "play");
 let ACTIVE_LATEST_VERSION = LATEST_VERSION;
 let ACTIVE_MIN_CLIENT_VERSION = MIN_CLIENT_VERSION;
 let ACTIVE_RELEASE_TAG = RELEASE_TAG;
 let ACTIVE_DOWNLOAD_ASSET_NAME = DOWNLOAD_ASSET_NAME;
 let ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME = ANDROID_DOWNLOAD_ASSET_NAME;
+let ACTIVE_HTML5_DOWNLOAD_ASSET_NAME = HTML5_DOWNLOAD_ASSET_NAME;
 const USE_RELEASE_PROXY = process.env.SPACEROCKS_USE_RELEASE_PROXY !== "false";
 const OWNER_SECRET = process.env.SPACEROCKS_OWNER_SECRET || "";
 const OWNER_PLAYER_ID = String(process.env.SPACEROCKS_OWNER_PLAYER_ID || "").toUpperCase();
@@ -587,15 +593,84 @@ function proxyDownloadUrl(req, tag = ACTIVE_RELEASE_TAG, assetName = ACTIVE_DOWN
 }
 
 function publicDownloadUrl(req, platform = "windows") {
-  const assetName = String(platform || "").toLowerCase() === "android"
+  const normalizedPlatform = String(platform || "").toLowerCase();
+  const assetName = normalizedPlatform === "android"
     ? ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME
-    : ACTIVE_DOWNLOAD_ASSET_NAME;
+    : (normalizedPlatform === "web" || normalizedPlatform === "html5" || normalizedPlatform === "browser"
+      ? ACTIVE_HTML5_DOWNLOAD_ASSET_NAME
+      : ACTIVE_DOWNLOAD_ASSET_NAME);
   if (USE_RELEASE_PROXY) return proxyDownloadUrl(req, ACTIVE_RELEASE_TAG, assetName);
   return DOWNLOAD_URL;
 }
 
 function publicReleaseUrl() {
   return `https://github.com/${encodeURIComponent(GITHUB_OWNER)}/${encodeURIComponent(GITHUB_REPO)}/releases/tag/${encodeURIComponent(ACTIVE_RELEASE_TAG || RELEASE_TAG)}`;
+}
+
+function publicBrowserPlayUrl(req) {
+  return BROWSER_PLAY_URL || `${serverOrigin(req)}/play/`;
+}
+
+function webContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".html") return "text/html; charset=utf-8";
+  if (ext === ".js") return "application/javascript; charset=utf-8";
+  if (ext === ".wasm") return "application/wasm";
+  if (ext === ".json") return "application/json; charset=utf-8";
+  if (ext === ".data" || ext === ".unx" || ext === ".yytex") return "application/octet-stream";
+  if (ext === ".md") return "text/markdown; charset=utf-8";
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".ico") return "image/x-icon";
+  return "application/octet-stream";
+}
+
+function serveBrowserGame(req, res, url) {
+  if (url.pathname === "/play") {
+    res.writeHead(302, { Location: "/play/" });
+    res.end();
+    return;
+  }
+
+  let relativePath = "";
+  try {
+    relativePath = decodeURIComponent(url.pathname.slice("/play/".length));
+  } catch {
+    sendJson(res, 400, { ok: false, message: "Invalid browser asset path." });
+    return;
+  }
+  if (!relativePath || relativePath.endsWith("/")) relativePath += "index.html";
+  relativePath = relativePath.replace(/\\/g, "/");
+  const target = path.resolve(WEB_BUILD_DIR, relativePath);
+  const root = path.resolve(WEB_BUILD_DIR);
+
+  if (!target.startsWith(root + path.sep) && target !== root) {
+    sendJson(res, 403, { ok: false, message: "Invalid browser asset path." });
+    return;
+  }
+
+  fs.stat(target, (statError, stats) => {
+    if (statError || !stats.isFile()) {
+      sendJson(res, 404, { ok: false, message: "Browser asset not found." });
+      return;
+    }
+
+    const headers = {
+      "Content-Type": webContentType(target),
+      "Content-Length": String(stats.size),
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": path.basename(target).toLowerCase() === "index.html" ? "no-cache" : "public, max-age=3600",
+      "X-Content-Type-Options": "nosniff"
+    };
+
+    const stream = fs.createReadStream(target);
+    stream.on("error", () => {
+      if (!res.headersSent) sendJson(res, 500, { ok: false, message: "Browser asset read failed." });
+      else res.destroy();
+    });
+    res.writeHead(200, headers);
+    stream.pipe(res);
+  });
 }
 
 function githubHeaders(accept) {
@@ -632,6 +707,7 @@ function launcherReleaseFallback(req) {
     name: `Gameboy ${ACTIVE_RELEASE_TAG}`,
     body: "Private GitHub Release. Download laeuft ueber den Render-Server.",
     html_url: RELEASE_URL,
+    browser_play_url: publicBrowserPlayUrl(req),
     private_release_proxy: true,
     github_private_access_configured: Boolean(GITHUB_TOKEN),
     assets: [
@@ -644,6 +720,11 @@ function launcherReleaseFallback(req) {
         name: ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME,
         size: 0,
         browser_download_url: proxyDownloadUrl(req, ACTIVE_RELEASE_TAG, ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME)
+      },
+      {
+        name: ACTIVE_HTML5_DOWNLOAD_ASSET_NAME,
+        size: 0,
+        browser_download_url: proxyDownloadUrl(req, ACTIVE_RELEASE_TAG, ACTIVE_HTML5_DOWNLOAD_ASSET_NAME)
       }
     ]
   };
@@ -659,6 +740,7 @@ async function launcherReleasePayload(req) {
       name: release.name || `Gameboy ${tag}`,
       body: release.body || "",
       html_url: release.html_url || RELEASE_URL,
+      browser_play_url: publicBrowserPlayUrl(req),
       private_release_proxy: USE_RELEASE_PROXY,
       github_private_access_configured: Boolean(GITHUB_TOKEN),
       assets: assets.map((asset) => ({
@@ -684,17 +766,24 @@ async function refreshActiveRelease() {
     const assets = Array.isArray(release.assets) ? release.assets : [];
     const preferredName = `Gameboy-v${version}-windows.zip`.toLowerCase();
     const preferredAndroidName = `Gameboy-v${version}-android.apk`.toLowerCase();
+    const preferredHtml5Name = `Gameboy-v${version}-HTML5.zip`.toLowerCase();
     const asset = assets.find((item) => String(item.name || "").toLowerCase() === preferredName)
       || assets.find((item) => String(item.name || "").toLowerCase().includes("windows") && String(item.name || "").toLowerCase().endsWith(".zip"));
     const androidAsset = assets.find((item) => String(item.name || "").toLowerCase() === preferredAndroidName)
       || assets.find((item) => String(item.name || "").toLowerCase().includes("android") && String(item.name || "").toLowerCase().endsWith(".apk"));
+    const html5Asset = assets.find((item) => String(item.name || "").toLowerCase() === preferredHtml5Name)
+      || assets.find((item) => {
+        const name = String(item.name || "").toLowerCase();
+        return (name.includes("html5") || name.includes("web")) && name.endsWith(".zip");
+      });
     if (tag && version && asset && compareVersion(version, ACTIVE_LATEST_VERSION) >= 0) {
       ACTIVE_RELEASE_TAG = tag;
       ACTIVE_LATEST_VERSION = version;
       if (compareVersion(ACTIVE_MIN_CLIENT_VERSION, ACTIVE_LATEST_VERSION) < 0) ACTIVE_MIN_CLIENT_VERSION = ACTIVE_LATEST_VERSION;
       ACTIVE_DOWNLOAD_ASSET_NAME = String(asset.name || `Gameboy-v${version}-windows.zip`);
       ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME = String(androidAsset && androidAsset.name || `Gameboy-v${version}-android.apk`);
-      console.log(`[UPDATE] active release ${ACTIVE_RELEASE_TAG} windows=${ACTIVE_DOWNLOAD_ASSET_NAME} android=${ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME}`);
+      ACTIVE_HTML5_DOWNLOAD_ASSET_NAME = String(html5Asset && html5Asset.name || `Gameboy-v${version}-HTML5.zip`);
+      console.log(`[UPDATE] active release ${ACTIVE_RELEASE_TAG} windows=${ACTIVE_DOWNLOAD_ASSET_NAME} android=${ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME} html5=${ACTIVE_HTML5_DOWNLOAD_ASSET_NAME}`);
     }
   } catch (error) {
     console.warn(`[UPDATE] latest release refresh failed: ${error.message}`);
@@ -719,6 +808,10 @@ async function streamGithubReleaseAsset(req, res, tag, assetName) {
     const wanted = String(assetName || ACTIVE_DOWNLOAD_ASSET_NAME).toLowerCase();
     const asset = assets.find((item) => String(item.name || "").toLowerCase() === wanted)
       || (wanted.endsWith(".apk") ? assets.find((item) => String(item.name || "").toLowerCase().includes("android") && String(item.name || "").toLowerCase().endsWith(".apk")) : null)
+      || ((wanted.includes("html5") || wanted.includes("web")) ? assets.find((item) => {
+        const name = String(item.name || "").toLowerCase();
+        return (name.includes("html5") || name.includes("web")) && name.endsWith(".zip");
+      }) : null)
       || assets.find((item) => String(item.name || "").toLowerCase().includes("windows") && String(item.name || "").toLowerCase().endsWith(".zip"))
       || assets.find((item) => String(item.name || "").toLowerCase().endsWith(".zip"));
 
@@ -2582,6 +2675,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/play" || url.pathname.startsWith("/play/")) {
+    serveBrowserGame(req, res, url);
+    return;
+  }
+
   if (enforceRateLimit(req, res, url.pathname)) return;
 
   if (url.pathname.startsWith("/admin/")) {
@@ -3669,7 +3767,10 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/version/check") {
     const gameVersion = String(url.searchParams.get("game_version") || "0").trim();
-    const platform = String(url.searchParams.get("platform") || "windows").toLowerCase() === "android" ? "android" : "windows";
+    const requestedPlatform = String(url.searchParams.get("platform") || "windows").toLowerCase();
+    const platform = requestedPlatform === "android"
+      ? "android"
+      : (requestedPlatform === "web" || requestedPlatform === "html5" || requestedPlatform === "browser" ? "web" : "windows");
     await refreshActiveRelease();
     const updateRequired = compareVersion(gameVersion, ACTIVE_MIN_CLIENT_VERSION) < 0;
     const unpublished = compareVersion(gameVersion, ACTIVE_LATEST_VERSION) > 0;
@@ -3687,8 +3788,11 @@ const server = http.createServer(async (req, res) => {
       download_url: publicDownloadUrl(req, platform),
       windows_download_url: publicDownloadUrl(req, "windows"),
       android_download_url: publicDownloadUrl(req, "android"),
+      html5_download_url: publicDownloadUrl(req, "web"),
+      browser_play_url: publicBrowserPlayUrl(req),
       windows_asset: ACTIVE_DOWNLOAD_ASSET_NAME,
       android_asset: ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME,
+      html5_asset: ACTIVE_HTML5_DOWNLOAD_ASSET_NAME,
       platform
     });
     return;
@@ -3724,6 +3828,7 @@ const server = http.createServer(async (req, res) => {
       min_client_version: ACTIVE_MIN_CLIENT_VERSION,
       release_url: publicReleaseUrl(),
       download_url: publicDownloadUrl(req),
+      browser_play_url: publicBrowserPlayUrl(req),
       private_release_proxy: USE_RELEASE_PROXY,
       github_private_access_configured: Boolean(GITHUB_TOKEN),
       owner_auth_configured: ownerIdentityConfigured(),
