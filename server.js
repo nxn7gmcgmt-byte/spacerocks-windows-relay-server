@@ -3660,6 +3660,8 @@ const server = http.createServer(async (req, res) => {
       current_version: gameVersion,
       latest_version: ACTIVE_LATEST_VERSION,
       min_client_version: ACTIVE_MIN_CLIENT_VERSION,
+      realtime_optimized: true,
+      relay_performance_version: 2,
       release_url: RELEASE_URL,
       download_url: publicDownloadUrl(req)
     });
@@ -3690,6 +3692,8 @@ const server = http.createServer(async (req, res) => {
       rooms: rooms.size,
       open_rooms: openLobbies().length,
       players: Array.from(rooms.values()).reduce((sum, room) => sum + connectedCount(room), 0),
+      realtime_optimized: true,
+      relay_performance_version: 2,
       latest_version: ACTIVE_LATEST_VERSION,
       min_client_version: ACTIVE_MIN_CLIENT_VERSION,
       release_url: RELEASE_URL,
