@@ -19,8 +19,8 @@ const WS_MAX_PAYLOAD_BYTES = 512 * 1024;
 const WS_DROP_BUFFERED_BYTES = 192 * 1024;
 const WS_SNAPSHOT_DROP_BUFFERED_BYTES = 384 * 1024;
 const WS_HEARTBEAT_MS = 25000;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.21";
-const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.21";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.22";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.22";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const GITHUB_OWNER = process.env.SPACEROCKS_GITHUB_OWNER || "nxn7gmcgmt-byte";
@@ -28,10 +28,12 @@ const GITHUB_REPO = process.env.SPACEROCKS_GITHUB_REPO || "SpaceRocks";
 const GITHUB_TOKEN = process.env.SPACEROCKS_GITHUB_TOKEN || process.env.GITHUB_TOKEN || "";
 const RELEASE_TAG = process.env.SPACEROCKS_RELEASE_TAG || `v${LATEST_VERSION}`;
 const DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_DOWNLOAD_ASSET_NAME || `Gameboy-v${LATEST_VERSION}-windows.zip`;
+const ANDROID_DOWNLOAD_ASSET_NAME = process.env.SPACEROCKS_ANDROID_DOWNLOAD_ASSET_NAME || `Gameboy-v${LATEST_VERSION}-android.apk`;
 let ACTIVE_LATEST_VERSION = LATEST_VERSION;
 let ACTIVE_MIN_CLIENT_VERSION = MIN_CLIENT_VERSION;
 let ACTIVE_RELEASE_TAG = RELEASE_TAG;
 let ACTIVE_DOWNLOAD_ASSET_NAME = DOWNLOAD_ASSET_NAME;
+let ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME = ANDROID_DOWNLOAD_ASSET_NAME;
 const USE_RELEASE_PROXY = process.env.SPACEROCKS_USE_RELEASE_PROXY !== "false";
 const OWNER_SECRET = process.env.SPACEROCKS_OWNER_SECRET || "";
 const OWNER_PLAYER_ID = String(process.env.SPACEROCKS_OWNER_PLAYER_ID || "").toUpperCase();
@@ -584,8 +586,11 @@ function proxyDownloadUrl(req, tag = ACTIVE_RELEASE_TAG, assetName = ACTIVE_DOWN
   return `${serverOrigin(req)}/download/${encodeURIComponent(tag)}/${encodeURIComponent(assetName)}`;
 }
 
-function publicDownloadUrl(req) {
-  if (USE_RELEASE_PROXY) return proxyDownloadUrl(req);
+function publicDownloadUrl(req, platform = "windows") {
+  const assetName = String(platform || "").toLowerCase() === "android"
+    ? ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME
+    : ACTIVE_DOWNLOAD_ASSET_NAME;
+  if (USE_RELEASE_PROXY) return proxyDownloadUrl(req, ACTIVE_RELEASE_TAG, assetName);
   return DOWNLOAD_URL;
 }
 
@@ -634,6 +639,11 @@ function launcherReleaseFallback(req) {
         name: ACTIVE_DOWNLOAD_ASSET_NAME,
         size: 0,
         browser_download_url: proxyDownloadUrl(req, ACTIVE_RELEASE_TAG, ACTIVE_DOWNLOAD_ASSET_NAME)
+      },
+      {
+        name: ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME,
+        size: 0,
+        browser_download_url: proxyDownloadUrl(req, ACTIVE_RELEASE_TAG, ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME)
       }
     ]
   };
@@ -673,14 +683,18 @@ async function refreshActiveRelease() {
     const version = tag.replace(/^v/i, "");
     const assets = Array.isArray(release.assets) ? release.assets : [];
     const preferredName = `Gameboy-v${version}-windows.zip`.toLowerCase();
+    const preferredAndroidName = `Gameboy-v${version}-android.apk`.toLowerCase();
     const asset = assets.find((item) => String(item.name || "").toLowerCase() === preferredName)
       || assets.find((item) => String(item.name || "").toLowerCase().includes("windows") && String(item.name || "").toLowerCase().endsWith(".zip"));
+    const androidAsset = assets.find((item) => String(item.name || "").toLowerCase() === preferredAndroidName)
+      || assets.find((item) => String(item.name || "").toLowerCase().includes("android") && String(item.name || "").toLowerCase().endsWith(".apk"));
     if (tag && version && asset && compareVersion(version, ACTIVE_LATEST_VERSION) >= 0) {
       ACTIVE_RELEASE_TAG = tag;
       ACTIVE_LATEST_VERSION = version;
       if (compareVersion(ACTIVE_MIN_CLIENT_VERSION, ACTIVE_LATEST_VERSION) < 0) ACTIVE_MIN_CLIENT_VERSION = ACTIVE_LATEST_VERSION;
       ACTIVE_DOWNLOAD_ASSET_NAME = String(asset.name || `Gameboy-v${version}-windows.zip`);
-      console.log(`[UPDATE] active release ${ACTIVE_RELEASE_TAG} asset=${ACTIVE_DOWNLOAD_ASSET_NAME}`);
+      ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME = String(androidAsset && androidAsset.name || `Gameboy-v${version}-android.apk`);
+      console.log(`[UPDATE] active release ${ACTIVE_RELEASE_TAG} windows=${ACTIVE_DOWNLOAD_ASSET_NAME} android=${ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME}`);
     }
   } catch (error) {
     console.warn(`[UPDATE] latest release refresh failed: ${error.message}`);
@@ -704,6 +718,7 @@ async function streamGithubReleaseAsset(req, res, tag, assetName) {
     const assets = Array.isArray(release.assets) ? release.assets : [];
     const wanted = String(assetName || ACTIVE_DOWNLOAD_ASSET_NAME).toLowerCase();
     const asset = assets.find((item) => String(item.name || "").toLowerCase() === wanted)
+      || (wanted.endsWith(".apk") ? assets.find((item) => String(item.name || "").toLowerCase().includes("android") && String(item.name || "").toLowerCase().endsWith(".apk")) : null)
       || assets.find((item) => String(item.name || "").toLowerCase().includes("windows") && String(item.name || "").toLowerCase().endsWith(".zip"))
       || assets.find((item) => String(item.name || "").toLowerCase().endsWith(".zip"));
 
@@ -3654,6 +3669,7 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/version/check") {
     const gameVersion = String(url.searchParams.get("game_version") || "0").trim();
+    const platform = String(url.searchParams.get("platform") || "windows").toLowerCase() === "android" ? "android" : "windows";
     await refreshActiveRelease();
     const updateRequired = compareVersion(gameVersion, ACTIVE_MIN_CLIENT_VERSION) < 0;
     const unpublished = compareVersion(gameVersion, ACTIVE_LATEST_VERSION) > 0;
@@ -3668,7 +3684,12 @@ const server = http.createServer(async (req, res) => {
       realtime_optimized: true,
       relay_performance_version: 2,
       release_url: publicReleaseUrl(),
-      download_url: publicDownloadUrl(req)
+      download_url: publicDownloadUrl(req, platform),
+      windows_download_url: publicDownloadUrl(req, "windows"),
+      android_download_url: publicDownloadUrl(req, "android"),
+      windows_asset: ACTIVE_DOWNLOAD_ASSET_NAME,
+      android_asset: ACTIVE_ANDROID_DOWNLOAD_ASSET_NAME,
+      platform
     });
     return;
   }
