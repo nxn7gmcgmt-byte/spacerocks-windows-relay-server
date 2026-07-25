@@ -15,6 +15,10 @@ const REPLAY_MAX_FRAMES = 1800;
 const MAX_SPECTATORS_PER_MATCH = 32;
 const MAX_TEAM_SIZE = 100;
 const MAX_PLAYERS = 200;
+const WS_MAX_PAYLOAD_BYTES = 512 * 1024;
+const WS_DROP_BUFFERED_BYTES = 192 * 1024;
+const WS_SNAPSHOT_DROP_BUFFERED_BYTES = 384 * 1024;
+const WS_HEARTBEAT_MS = 25000;
 const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.19";
 const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.19";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
@@ -1907,10 +1911,27 @@ function sanitizeSkin(skin) {
   return Math.max(0, Math.min(8, Math.floor(value)));
 }
 
-function send(ws, data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data) + "\0");
+function packetText(data) {
+  return JSON.stringify(data) + "\0";
+}
+
+function sendPacket(ws, payload, options = {}) {
+  options = options || {};
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  const dropIfBuffered = options.dropIfBuffered === true;
+  const maxBufferedBytes = Number(options.maxBufferedBytes || WS_DROP_BUFFERED_BYTES);
+  if (dropIfBuffered && ws.bufferedAmount > maxBufferedBytes) return false;
+
+  try {
+    ws.send(payload, { compress: options.compress !== false });
+    return true;
+  } catch {
+    return false;
   }
+}
+
+function send(ws, data, options = {}) {
+  return sendPacket(ws, packetText(data), options);
 }
 
 function safeJson(text) {
@@ -1980,8 +2001,9 @@ function clearClosedPlayers(room) {
 }
 
 function broadcastRoom(room, data, except = null) {
+  const payload = packetText(data);
   for (const player of roomPlayers(room)) {
-    if (player !== except) send(player, data);
+    if (player !== except) sendPacket(player, payload);
   }
 }
 
@@ -1995,8 +2017,90 @@ function roomSpectators(room) {
   return active;
 }
 
-function broadcastSpectators(room, data) {
-  for (const spectator of roomSpectators(room)) send(spectator, data);
+function broadcastRoomRealtime(room, data, except = null, options = {}) {
+  const payload = packetText(data);
+  for (const player of roomPlayers(room)) {
+    if (player !== except) sendPacket(player, payload, options);
+  }
+}
+
+function broadcastSpectators(room, data, options = {}) {
+  options = options || {};
+  const payload = packetText(data);
+  for (const spectator of roomSpectators(room)) sendPacket(spectator, payload, options);
+}
+
+function snapshotPlayersForHighlights(snapshot) {
+  if (snapshot && Array.isArray(snapshot.players)) return snapshot.players;
+  if (snapshot && Array.isArray(snapshot.p)) {
+    return snapshot.p.map((row) => {
+      if (!Array.isArray(row)) return {};
+      return {
+        kills: Math.max(0, Math.floor(Number(row[8] || 0)))
+      };
+    });
+  }
+  return [];
+}
+
+function clampRealtimeAngle(value) {
+  const angle = Math.floor(Number(value || 0));
+  if (!Number.isFinite(angle)) return 0;
+  return ((angle % 360) + 360) % 360;
+}
+
+function inputMaskFromObject(input) {
+  if (!input || typeof input !== "object") return 0;
+  let mask = 0;
+  if (input.move_up === true) mask |= 1;
+  if (input.move_down === true) mask |= 2;
+  if (input.move_left === true) mask |= 4;
+  if (input.move_right === true) mask |= 8;
+  if (input.shoot === true) mask |= 16;
+  if (input.dash === true) mask |= 32;
+  return mask;
+}
+
+function compactRealtimeInput(msg) {
+  const input = msg && typeof msg.input === "object" ? msg.input : {};
+  const rawMask = Number.isFinite(Number(msg && msg.i)) ? Number(msg.i) : Number(input.i);
+  const mask = Number.isFinite(rawMask) ? Math.max(0, Math.min(63, Math.floor(rawMask))) : inputMaskFromObject(input);
+  const rawAngle = Number.isFinite(Number(msg && msg.a)) ? Number(msg.a) : Number(input.aim_direction || input.a || 0);
+  return {
+    frame: Math.max(0, Math.floor(Number((msg && (msg.frame ?? msg.f)) || 0))),
+    i: mask,
+    a: clampRealtimeAngle(rawAngle)
+  };
+}
+
+function inputObjectFromMask(mask, angle) {
+  const bits = Math.max(0, Math.min(63, Math.floor(Number(mask || 0))));
+  return {
+    move_up: (bits & 1) !== 0,
+    move_down: (bits & 2) !== 0,
+    move_left: (bits & 4) !== 0,
+    move_right: (bits & 8) !== 0,
+    aim_direction: clampRealtimeAngle(angle),
+    shoot: (bits & 16) !== 0,
+    dash: (bits & 32) !== 0
+  };
+}
+
+function realtimeMinInterval(room, type) {
+  const playerCount = room ? Math.max(2, Number(room.maxPlayers || 2)) : 2;
+  if (type === "snapshot") return playerCount > 4 ? 95 : 65;
+  if (String(type || "").startsWith("bot_input")) return playerCount > 4 ? 32 : 20;
+  return playerCount > 4 ? 24 : 14;
+}
+
+function acceptRealtimePacket(ws, room, type) {
+  const now = Date.now();
+  const typeText = String(type || "");
+  const key = type === "snapshot" ? "lastSnapshotAt" : (typeText.startsWith("bot_input:") ? `lastBotInputAt_${typeText.split(":")[1] || "x"}` : "lastInputAt");
+  const minimum = realtimeMinInterval(room, type);
+  if (ws[key] && now - ws[key] < minimum) return false;
+  ws[key] = now;
+  return true;
 }
 
 function resetRoomReplay(room) {
@@ -2018,7 +2122,7 @@ function recordRoomSnapshot(room, snapshot) {
   room.latestSnapshot = snapshot;
   room.replaySnapshotCount += 1;
   const elapsed = Math.max(0, Date.now() - (room.matchStartedAt || Date.now()));
-  const snapshotPlayers = Array.isArray(snapshot.players) ? snapshot.players : [];
+  const snapshotPlayers = snapshotPlayersForHighlights(snapshot);
 
   for (let slot = 0; slot < snapshotPlayers.length; slot += 1) {
     const kills = Math.max(0, Math.floor(Number(snapshotPlayers[slot] && snapshotPlayers[slot].kills || 0)));
@@ -4103,9 +4207,23 @@ const server = http.createServer(async (req, res) => {
   res.end("Gameboy Windows Relay online");
 });
 
-const wss = new WebSocket.Server({ server });
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 70000;
+server.requestTimeout = 15000;
+
+const wss = new WebSocket.Server({
+  server,
+  maxPayload: WS_MAX_PAYLOAD_BYTES,
+  perMessageDeflate: {
+    threshold: 768,
+    serverNoContextTakeover: true,
+    clientNoContextTakeover: true,
+    concurrencyLimit: 8
+  }
+});
 
 wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
   ws.playerId = -1;
   ws.roomCode = "";
   ws.skin = 0;
@@ -4122,6 +4240,7 @@ wss.on("connection", (ws, req) => {
   ws.isSpectator = false;
   ws.remoteAddress = String((req.socket && req.socket.remoteAddress) || req.headers["x-forwarded-for"] || "").split(",")[0].trim();
   ws.ipHash = connectionIpHash(ws);
+  ws.on("pong", () => { ws.isAlive = true; });
 
   ws.on("message", (raw) => {
     const msg = safeJson(String(raw).replace(/\0/g, "").trim());
@@ -4458,25 +4577,42 @@ wss.on("connection", (ws, req) => {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
       if (!room || ws.playerId !== room.hostPlayerId) return;
       const botPlayer = Math.max(0, Math.min(room.maxPlayers - 1, Math.floor(Number(msg.player || 0))));
+      if (!acceptRealtimePacket(ws, room, `bot_input:${botPlayer}`)) return;
       if (!room.botSlots || !room.botSlots[botPlayer]) return;
-      broadcastRoom(room, { cmd: "input", player: botPlayer, input: msg.input || {}, frame: msg.frame || 0 }, ws);
+      const compact = compactRealtimeInput(msg);
+      broadcastRoomRealtime(room, { cmd: "input", player: botPlayer, frame: compact.frame, i: compact.i, a: compact.a, input: inputObjectFromMask(compact.i, compact.a) }, ws, {
+        dropIfBuffered: true,
+        maxBufferedBytes: WS_DROP_BUFFERED_BYTES,
+        compress: false
+      });
       return;
     }
 
     if (msg.cmd === "input") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
       if (!room || ws.playerId < 0) return;
-      broadcastRoom(room, { cmd: "input", player: ws.playerId, input: msg.input || {}, frame: msg.frame || 0 }, ws);
+      if (!acceptRealtimePacket(ws, room, "input")) return;
+      const compact = compactRealtimeInput(msg);
+      broadcastRoomRealtime(room, { cmd: "input", player: ws.playerId, frame: compact.frame, i: compact.i, a: compact.a, input: inputObjectFromMask(compact.i, compact.a) }, ws, {
+        dropIfBuffered: true,
+        maxBufferedBytes: WS_DROP_BUFFERED_BYTES,
+        compress: false
+      });
       return;
     }
 
     if (msg.cmd === "snapshot") {
       const room = ws.roomCode ? rooms.get(ws.roomCode) : null;
       if (!room || ws.playerId !== room.hostPlayerId) return;
+      if (!acceptRealtimePacket(ws, room, "snapshot")) return;
       const snapshot = msg.snapshot || {};
       recordRoomSnapshot(room, snapshot);
-      broadcastRoom(room, { cmd: "snapshot", snapshot }, ws);
-      broadcastSpectators(room, { cmd: "snapshot", snapshot });
+      const options = {
+        dropIfBuffered: true,
+        maxBufferedBytes: WS_SNAPSHOT_DROP_BUFFERED_BYTES
+      };
+      broadcastRoomRealtime(room, { cmd: "snapshot", snapshot }, ws, options);
+      broadcastSpectators(room, { cmd: "snapshot", snapshot }, options);
       return;
     }
 
@@ -4558,6 +4694,16 @@ wss.on("connection", (ws, req) => {
 
 setInterval(cleanupExpiredRooms, 30000);
 setInterval(cleanScoreSessions, 60000);
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, WS_HEARTBEAT_MS).unref();
 
 server.listen(PORT, () => {
   console.log(`Gameboy Windows relay listening on ${PORT}`);
