@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
     <title>Gameboy</title>
+    <link rel="icon" href="data:," />
     <style>
       @-webkit-keyframes rotation {
         from {
@@ -179,6 +180,32 @@
    <script>
      window.adsbygoogle = window.adsbygoogle || [];
      const adBreak = adConfig = function() {};
+     (function() {
+       var ignoredConsoleParts = [
+         "Prevented call into an uninitialised yyal",
+         "current cache entries are",
+         "considering file ",
+         "current cache files are",
+         "Prepare cache completed",
+         "Failed to get WEBGL_compressed_texture"
+       ];
+       function shouldIgnoreConsole(args) {
+         var text = "";
+         for (var i = 0; i < args.length; i++) text += String(args[i]) + " ";
+         for (var j = 0; j < ignoredConsoleParts.length; j++) {
+           if (text.indexOf(ignoredConsoleParts[j]) >= 0) return true;
+         }
+         return false;
+       }
+       ["log", "warn", "error"].forEach(function(method) {
+         var original = console[method];
+         if (typeof original !== "function") return;
+         console[method] = function() {
+           if (shouldIgnoreConsole(arguments)) return;
+           return original.apply(console, arguments);
+         };
+       });
+     })();
      document.addEventListener("contextmenu", function(event) { event.preventDefault(); });
      document.addEventListener("touchmove", function(event) { event.preventDefault(); }, { passive: false });
      window.addEventListener("keydown", function(event) {

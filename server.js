@@ -655,11 +655,17 @@ function serveBrowserGame(req, res, url) {
       return;
     }
 
+    const fileName = path.basename(target).toLowerCase();
+    const ext = path.extname(target).toLowerCase();
+    const cacheControl = fileName === "index.html" || ext === ".unx" || ext === ".js" || ext === ".json"
+      ? "no-cache"
+      : "public, max-age=3600";
+
     const headers = {
       "Content-Type": webContentType(target),
       "Content-Length": String(stats.size),
       "Access-Control-Allow-Origin": "*",
-      "Cache-Control": path.basename(target).toLowerCase() === "index.html" ? "no-cache" : "public, max-age=3600",
+      "Cache-Control": cacheControl,
       "X-Content-Type-Options": "nosniff"
     };
 
@@ -2672,6 +2678,15 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "OPTIONS") {
     sendJson(res, 204, {});
+    return;
+  }
+
+  if (url.pathname === "/favicon.ico") {
+    res.writeHead(204, {
+      "Cache-Control": "public, max-age=86400",
+      "X-Content-Type-Options": "nosniff"
+    });
+    res.end();
     return;
   }
 
