@@ -678,6 +678,7 @@ async function refreshActiveRelease() {
     if (tag && version && asset && compareVersion(version, ACTIVE_LATEST_VERSION) >= 0) {
       ACTIVE_RELEASE_TAG = tag;
       ACTIVE_LATEST_VERSION = version;
+      if (compareVersion(ACTIVE_MIN_CLIENT_VERSION, ACTIVE_LATEST_VERSION) < 0) ACTIVE_MIN_CLIENT_VERSION = ACTIVE_LATEST_VERSION;
       ACTIVE_DOWNLOAD_ASSET_NAME = String(asset.name || `Gameboy-v${version}-windows.zip`);
       console.log(`[UPDATE] active release ${ACTIVE_RELEASE_TAG} asset=${ACTIVE_DOWNLOAD_ASSET_NAME}`);
     }
