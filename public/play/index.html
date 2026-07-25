@@ -572,6 +572,14 @@
           };
         }
 
+        var GAMEBOY_BROWSER_BUILD = "20260725_daily_back_safe_73043042";
+
+        function versionedGameFileUrl(path) {
+          var url = String(path || "");
+          var separator = url.indexOf("?") >= 0 ? "&" : "?";
+          return url + separator + "v=" + encodeURIComponent(GAMEBOY_BROWSER_BUILD);
+        }
+
         function storageKey(bucket, path) {
           return "gameboy:" + bucket + ":" + path;
         }
@@ -611,16 +619,17 @@
               var files = manifestFiles().split(";");
               var hashes = manifestFilesMD5();
               return files.map(function(name, index) {
-                return { fileId: name + ":" + hashes[index], version: "browser" };
+                return { fileId: name + ":" + hashes[index] + ":" + GAMEBOY_BROWSER_BUILD, version: GAMEBOY_BROWSER_BUILD };
               });
             },
             delete: async function() {},
             fetchAndCache: async function(fileId, version, request) {
-              return fetch(request);
+              var requestUrl = request && request.url ? request.url : request;
+              return fetch(versionedGameFileUrl(requestUrl), { credentials: "same-origin", cache: "no-store" });
             },
             match: async function(fileId) {
               var name = String(fileId || "").split(":")[0];
-              return fetch(name, { credentials: "same-origin" });
+              return fetch(versionedGameFileUrl(name), { credentials: "same-origin", cache: "no-store" });
             }
           },
           gameStorage: {
