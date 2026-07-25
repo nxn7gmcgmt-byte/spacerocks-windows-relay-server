@@ -19,8 +19,8 @@ const WS_MAX_PAYLOAD_BYTES = 512 * 1024;
 const WS_DROP_BUFFERED_BYTES = 192 * 1024;
 const WS_SNAPSHOT_DROP_BUFFERED_BYTES = 384 * 1024;
 const WS_HEARTBEAT_MS = 25000;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.19";
-const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.19";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.20";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.20";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const GITHUB_OWNER = process.env.SPACEROCKS_GITHUB_OWNER || "nxn7gmcgmt-byte";
@@ -587,6 +587,10 @@ function proxyDownloadUrl(req, tag = ACTIVE_RELEASE_TAG, assetName = ACTIVE_DOWN
 function publicDownloadUrl(req) {
   if (USE_RELEASE_PROXY) return proxyDownloadUrl(req);
   return DOWNLOAD_URL;
+}
+
+function publicReleaseUrl() {
+  return `https://github.com/${encodeURIComponent(GITHUB_OWNER)}/${encodeURIComponent(GITHUB_REPO)}/releases/tag/${encodeURIComponent(ACTIVE_RELEASE_TAG || RELEASE_TAG)}`;
 }
 
 function githubHeaders(accept) {
@@ -1867,7 +1871,7 @@ function rejectOldClient(ws) {
     message: `Bitte update Gameboy auf ${ACTIVE_LATEST_VERSION}.`,
     latest_version: ACTIVE_LATEST_VERSION,
     min_version: ACTIVE_MIN_CLIENT_VERSION,
-    release_url: RELEASE_URL,
+    release_url: publicReleaseUrl(),
     download_url: ws && ws.downloadUrl ? ws.downloadUrl : DOWNLOAD_URL
   });
 }
@@ -3662,7 +3666,7 @@ const server = http.createServer(async (req, res) => {
       min_client_version: ACTIVE_MIN_CLIENT_VERSION,
       realtime_optimized: true,
       relay_performance_version: 2,
-      release_url: RELEASE_URL,
+      release_url: publicReleaseUrl(),
       download_url: publicDownloadUrl(req)
     });
     return;
@@ -3696,7 +3700,7 @@ const server = http.createServer(async (req, res) => {
       relay_performance_version: 2,
       latest_version: ACTIVE_LATEST_VERSION,
       min_client_version: ACTIVE_MIN_CLIENT_VERSION,
-      release_url: RELEASE_URL,
+      release_url: publicReleaseUrl(),
       download_url: publicDownloadUrl(req),
       private_release_proxy: USE_RELEASE_PROXY,
       github_private_access_configured: Boolean(GITHUB_TOKEN),
@@ -4199,7 +4203,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       latest_version: ACTIVE_LATEST_VERSION,
       min_client_version: ACTIVE_MIN_CLIENT_VERSION,
-      release_url: RELEASE_URL,
+      release_url: publicReleaseUrl(),
       download_url: publicDownloadUrl(req),
       private_release_proxy: USE_RELEASE_PROXY,
       github_private_access_configured: Boolean(GITHUB_TOKEN)
