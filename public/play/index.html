@@ -316,9 +316,13 @@
         },
       };
       Module.setStatus("Downloading...");
-      window.onerror = function (event) {
+      window.onerror = function (event, source, lineno, colno, error) {
         // TODO: do not warn on ok events like simulating an infinite loop or exitStatus
-        Module.setStatus("Exception thrown, see JavaScript console");
+        var details = String(event || "Unknown browser error");
+        if (source) details += " @ " + source + ":" + lineno + ":" + colno;
+        if (error && error.stack) details += "\n" + error.stack;
+        console.error(details);
+        Module.setStatus("Exception: " + details);
         spinnerElement.style.display = "none";
         Module.setStatus = function (text) {
           if (text) Module.printErr("[post-exception status] " + text);
@@ -572,7 +576,7 @@
           };
         }
 
-        var GAMEBOY_BROWSER_BUILD = "20260727_v1_0_29_perfect_enemy_ai_73099362";
+        var GAMEBOY_BROWSER_BUILD = "20260727_v1_0_30_troll_obby_variety_73154530";
 
         function versionedGameFileUrl(path) {
           var url = String(path || "");

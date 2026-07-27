@@ -21,8 +21,8 @@ const WS_MAX_PAYLOAD_BYTES = 512 * 1024;
 const WS_DROP_BUFFERED_BYTES = 192 * 1024;
 const WS_SNAPSHOT_DROP_BUFFERED_BYTES = 384 * 1024;
 const WS_HEARTBEAT_MS = 25000;
-const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.29";
-const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.29";
+const LATEST_VERSION = process.env.SPACEROCKS_LATEST_VERSION || "1.0.30";
+const MIN_CLIENT_VERSION = process.env.SPACEROCKS_MIN_CLIENT_VERSION || "1.0.30";
 const RELEASE_URL = process.env.SPACEROCKS_RELEASE_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const DOWNLOAD_URL = process.env.SPACEROCKS_DOWNLOAD_URL || "https://github.com/nxn7gmcgmt-byte/SpaceRocks/releases/latest";
 const GITHUB_OWNER = process.env.SPACEROCKS_GITHUB_OWNER || "nxn7gmcgmt-byte";
@@ -105,6 +105,10 @@ const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 const ADMIN_RECHECK_SECONDS = 300;
 const SCORE_SESSION_TTL_MS = 1000 * 60 * 60 * 6;
 const SCORE_MAX_SUBMISSIONS = 260;
+const OBBY_TIME_SESSION_TTL_MS = 1000 * 60 * 60 * 2;
+const OBBY_LEADERBOARD_IDS = String(process.env.SPACEROCKS_OBBY_LEADERBOARD_IDS || "")
+  .split(",")
+  .map(value => Math.floor(Number(value.trim()) || 0));
 const RATE_LIMIT_WINDOW_MS = 1000 * 60;
 const RATE_LIMIT_MAX_DEFAULT = 240;
 const RATE_LIMIT_MAX_AUTH = 30;
@@ -121,6 +125,7 @@ const RESERVED_USERNAMES = new Set(["owner", "admin", "moderator", "helper", "su
 
 const rooms = new Map();
 const scoreSessions = new Map();
+const obbyTimeSessions = new Map();
 const rateLimitBuckets = new Map();
 const securityProfiles = new Map();
 const securityReports = [];
@@ -187,6 +192,12 @@ function scoreLeaderboardId(kind, wave) {
   if (safeWave >= 22 && safeWave <= 40) return 34958 + safeWave;
   if (safeWave <= 122) return 35108 + (safeWave - 41);
   return 35191 + (safeWave - 123);
+}
+
+function obbyLeaderboardId(level) {
+  const safeLevel = Math.floor(Number(level || 0));
+  if (safeLevel < 1 || safeLevel > 100) return 0;
+  return Math.max(0, Math.floor(Number(OBBY_LEADERBOARD_IDS[safeLevel - 1] || 0)));
 }
 
 function cleanScoreSessions() {
@@ -2049,6 +2060,13 @@ function sendPacket(ws, payload, options = {}) {
   }
 }
 
+function cleanObbyTimeSessions() {
+  const now = Date.now();
+  for (const [token, session] of obbyTimeSessions.entries()) {
+    if (!session || now - session.createdAt > OBBY_TIME_SESSION_TTL_MS) obbyTimeSessions.delete(token);
+  }
+}
+
 function send(ws, data, options = {}) {
   return sendPacket(ws, packetText(data), options);
 }
@@ -3870,6 +3888,107 @@ const server = http.createServer(async (req, res) => {
       uptime_seconds: Math.floor(process.uptime()),
       maintenance: adminState.maintenance
     });
+    return;
+  }
+
+  if (url.pathname === "/obby-time/start" && req.method === "POST") {
+    cleanObbyTimeSessions();
+    const body = await readJson(req);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
+    const gameVersion = String(body.game_version || "0").trim();
+    if (!clientVersionOk(gameVersion)) {
+      sendJson(res, 426, { ok: false, message: `Gameboy ${ACTIVE_MIN_CLIENT_VERSION} or newer is required.` });
+      return;
+    }
+    if (activeBanForAuth(auth) || leaderboardSoftBans.has(auth.playerId)) {
+      sendJson(res, 403, { ok: false, message: "Online leaderboards are disabled for this account." });
+      return;
+    }
+    if (body.debug_build === true || body.test_mode === true || body.admin_modified === true) {
+      sendJson(res, 403, { ok: false, message: "Debug, test and owner-modified runs cannot use public leaderboards." });
+      return;
+    }
+    const level = boundedInt(body.level, 1, 100, 0);
+    const leaderboardId = obbyLeaderboardId(level);
+    if (!leaderboardId) {
+      sendJson(res, 503, { ok: false, message: `Obby leaderboard for level ${level} is not configured.` });
+      return;
+    }
+    const token = makeToken();
+    obbyTimeSessions.set(token, {
+      createdAt: Date.now(),
+      playerId: auth.playerId,
+      accountId: String(auth.session && auth.session.account_id || ""),
+      level,
+      leaderboardId,
+      submitted: false
+    });
+    sendJson(res, 201, {
+      ok: true,
+      obby_token: token,
+      level,
+      expires_in_seconds: Math.floor(OBBY_TIME_SESSION_TTL_MS / 1000)
+    });
+    return;
+  }
+
+  if (url.pathname === "/obby-time/submit" && req.method === "POST") {
+    cleanObbyTimeSessions();
+    const body = await readJson(req);
+    const auth = requireRequestAuth(req, res, body.player_id);
+    if (!auth) return;
+    const token = String(body.obby_token || "");
+    const session = obbyTimeSessions.get(token);
+    if (!session || session.accountId !== String(auth.session && auth.session.account_id || "")) {
+      sendJson(res, 401, { ok: false, message: "Obby time session is missing, expired or belongs to another account." });
+      return;
+    }
+    if (session.submitted) {
+      sendJson(res, 409, { ok: false, message: "This Obby level time was already submitted." });
+      return;
+    }
+    if (activeBanForAuth(auth) || leaderboardSoftBans.has(auth.playerId) || adminState.leaderboard_frozen) {
+      sendJson(res, 403, { ok: false, message: "Leaderboard upload is currently disabled." });
+      return;
+    }
+    if (body.admin_modified === true) {
+      sendJson(res, 403, { ok: false, message: "Owner/admin modified runs cannot use public leaderboards." });
+      return;
+    }
+    const level = boundedInt(body.level, 1, 100, 0);
+    const timeMs = boundedInt(body.time_ms, 1, 60 * 60 * 1000, 0);
+    const elapsedMs = Math.max(0, Date.now() - session.createdAt);
+    if (level !== session.level || !timeMs) {
+      sendJson(res, 422, { ok: false, message: "Obby level or time is invalid." });
+      return;
+    }
+    if (timeMs < 2500 || elapsedMs + 5000 < timeMs) {
+      recordSecurityReport("invalid_obby_time", auth, { level, time_ms: timeMs, elapsed_ms: elapsedMs });
+      sendJson(res, 422, { ok: false, message: "Obby completion time is not plausible." });
+      return;
+    }
+    const lootLockerToken = String(body.lootlocker_session_token || "").trim();
+    if (!lootLockerToken) {
+      sendJson(res, 422, { ok: false, message: "LootLocker session is missing." });
+      return;
+    }
+    try {
+      const response = await fetch(`https://api.lootlocker.io/game/leaderboards/${session.leaderboardId}/submit`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-token": lootLockerToken
+        },
+        body: JSON.stringify({ score: timeMs })
+      });
+      const responseText = await response.text().catch(() => "");
+      if (!response.ok) throw new Error(`LootLocker ${response.status}: ${responseText.slice(0, 160)}`);
+      session.submitted = true;
+      sendJson(res, 200, { ok: true, protected: true, level, score: timeMs });
+    } catch (submitError) {
+      sendJson(res, 502, { ok: false, message: submitError.message || "LootLocker Obby upload failed." });
+    }
     return;
   }
 
